@@ -1,0 +1,652 @@
+"""Backtesting service: runs test cases against a prompt+model and scores results."""
+from __future__ import annotations
+
+import asyncio
+import difflib
+import json
+import logging
+import re
+import time
+from collections import Counter
+from datetime import datetime, timezone
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.database import async_session
+from app.models.document import Document
+from app.models.model_config import ModelConfig
+from app.models.post_training import BacktestResult, BacktestRun, InferenceCache, TestCase
+from app.models.prompt import PromptVersion
+from app.providers.registry import get_provider
+from app.services import assertion_engine
+from app.services.model_config_service import decrypt_api_key
+
+logger = logging.getLogger(__name__)
+
+MAX_CONCURRENT = 5
+DEFAULT_MAX_TOKENS = 4096
+
+# Serializes all DB writes coming out of concurrent run_single coroutines.
+# aiosqlite's threading model + SQLAlchemy async sessions don't always honor
+# SQLite's busy_timeout reliably across concurrent commits; a Python-level
+# lock is the simplest guaranteed serialization.  Inference calls (the slow
+# part) still run concurrently — only the brief commit step serializes.
+_DB_WRITE_LOCK = asyncio.Lock()
+
+# ─── Scoring strategies per expected_type ─────────────────────────────────────
+
+_WORD_RE = re.compile(r"\b\w+\b")
+_STOP_WORDS = frozenset(
+    "a an the is are was were be been being have has had do does did will would "
+    "shall should may might can could of in to for on with at by from as into "
+    "through during before after above below between and but or nor not so yet "
+    "this that these those it its he she they them their his her".split()
+)
+
+
+def _tokenize(text: str) -> list[str]:
+    """Lowercase word tokens, stripping stop-words and very short tokens."""
+    words = _WORD_RE.findall(text.lower())
+    return [w for w in words if w not in _STOP_WORDS and len(w) > 1]
+
+
+def _score_generative(expected: str, actual: str) -> float:
+    """Keyword/concept overlap score for generative text.
+
+    Combines:
+    - Weighted keyword overlap (key concepts present in both)
+    - Sequence similarity (structural similarity)
+    """
+    expected_tokens = _tokenize(expected)
+    actual_tokens = _tokenize(actual)
+
+    if not expected_tokens:
+        # If the expected output has no meaningful tokens, fall back to sequence match
+        return difflib.SequenceMatcher(None, expected.lower().strip(), actual.lower().strip()).ratio()
+
+    expected_counts = Counter(expected_tokens)
+    actual_counts = Counter(actual_tokens)
+
+    # How many expected keywords appear in actual output
+    matched = sum(min(expected_counts[w], actual_counts[w]) for w in expected_counts)
+    keyword_recall = matched / sum(expected_counts.values())
+
+    # Structural similarity (lighter weight)
+    seq_ratio = difflib.SequenceMatcher(
+        None, expected.lower().strip(), actual.lower().strip()
+    ).ratio()
+
+    # Blend: 70% keyword recall + 30% structural similarity
+    return 0.7 * keyword_recall + 0.3 * seq_ratio
+
+
+def _score_classification(expected: str, actual: str) -> float:
+    """Exact/near-exact match for classification labels."""
+    e = expected.strip().lower()
+    a = actual.strip().lower()
+
+    # Exact match
+    if e == a:
+        return 1.0
+
+    # Check if the expected label appears anywhere in the actual output
+    # (model may add explanation around the label)
+    if e in a:
+        return 0.9
+
+    # Fuzzy match for minor differences
+    return difflib.SequenceMatcher(None, e, a).ratio()
+
+
+def _score_extraction(expected: str, actual: str) -> float:
+    """Key-phrase extraction scoring: checks that expected fragments are present."""
+    e_lower = expected.strip().lower()
+    a_lower = actual.strip().lower()
+
+    # Split expected into lines/phrases (each is a key fragment to find)
+    expected_fragments = [f.strip() for f in e_lower.split("\n") if f.strip()]
+
+    if not expected_fragments:
+        return difflib.SequenceMatcher(None, e_lower, a_lower).ratio()
+
+    found = 0
+    for fragment in expected_fragments:
+        if fragment in a_lower:
+            found += 1
+        else:
+            # Fuzzy match for each fragment
+            best = difflib.SequenceMatcher(None, fragment, a_lower).ratio()
+            if best >= 0.7:
+                found += 0.7
+
+    return found / len(expected_fragments)
+
+
+def _score_structured(expected: str, actual: str) -> float:
+    """Structural comparison — tighter sequence matching for JSON/structured output."""
+    # Normalize whitespace
+    e = " ".join(expected.split()).lower()
+    a = " ".join(actual.split()).lower()
+    return difflib.SequenceMatcher(None, e, a).ratio()
+
+
+def compute_score(expected: str, actual: str, expected_type: str) -> float:
+    """Route to the right scoring function based on test case type."""
+    scorers = {
+        "generative": _score_generative,
+        "classification": _score_classification,
+        "extraction": _score_extraction,
+        "structured": _score_structured,
+    }
+    scorer = scorers.get(expected_type, _score_generative)
+    return scorer(expected, actual)
+
+
+# ─── LLM-as-judge scoring ───────────────────────────────────────────────────
+
+_JUDGE_PROMPT = """You are an expert evaluator grading a model's response against the expected answer.
+
+TASK TYPE: {task_type}
+INPUT (what was asked):
+{input_text}
+
+EXPECTED ANSWER:
+{expected}
+
+MODEL'S ACTUAL ANSWER:
+{actual}
+
+Grade the actual answer on a scale of 0.0 to 1.0:
+- 1.0 = Semantically equivalent to the expected answer; all key facts match, minor wording differences OK
+- 0.8 = Mostly correct; captures the main idea with some minor omissions or inaccuracies
+- 0.5 = Partially correct; some key information is right, some is wrong or missing
+- 0.2 = Mostly wrong; only tangentially related to the expected answer
+- 0.0 = Completely wrong, off-topic, refuses to answer, or hallucinates
+
+Rules:
+- For classification tasks, focus on whether the final category matches.
+- For extraction tasks, check that extracted fields match by meaning, not exact string.
+- For structured output (JSON), check that the structure + values are equivalent.
+- For generative tasks, judge semantic equivalence, not surface form.
+
+Respond in strict JSON with this exact shape:
+{{"score": <float 0.0-1.0>, "reasoning": "<one-sentence explanation>"}}
+"""
+
+
+async def _score_with_judge(
+    judge_model: ModelConfig,
+    input_text: str,
+    expected: str,
+    actual: str,
+    expected_type: str,
+) -> tuple[float, str]:
+    """Score an actual vs expected output via an LLM grader.
+
+    Returns (score, reasoning).  Falls back to (0.0, error_reason) if the judge
+    fails to respond or returns invalid JSON.
+    """
+    api_key = decrypt_api_key(judge_model.api_key_encrypted) if judge_model.api_key_encrypted else None
+    provider = get_provider(judge_model.provider, api_key=api_key, base_url=judge_model.base_url)
+
+    prompt = _JUDGE_PROMPT.format(
+        task_type=expected_type,
+        input_text=input_text[:4000],
+        expected=expected[:4000],
+        actual=actual[:4000],
+    )
+
+    try:
+        response = await provider.generate(
+            messages=[{"role": "user", "content": prompt}],
+            model_id=judge_model.model_id,
+            max_tokens=400,
+            temperature=0.0,  # deterministic grading
+            **(judge_model.extra_params or {}),
+        )
+        raw = response.content.strip()
+        # Strip markdown fences if any
+        raw = re.sub(r"^```json\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
+        # Find the JSON object in the response
+        m = re.search(r"\{[\s\S]*\}", raw)
+        if not m:
+            return 0.0, f"Judge returned no JSON: {raw[:100]}"
+        data = json.loads(m.group(0))
+        score = float(data.get("score", 0.0))
+        reasoning = str(data.get("reasoning", ""))[:500]
+        # Clamp to valid range
+        score = max(0.0, min(1.0, score))
+        return score, reasoning
+    except Exception as e:
+        logger.warning("Judge scoring failed: %s", e)
+        return 0.0, f"Judge error: {e}"
+
+
+# ─── Backtest execution ──────────────────────────────────────────────────────
+
+async def run_backtest(backtest_run_id: str, db: AsyncSession | None = None) -> None:
+    """Execute a backtest run asynchronously.
+
+    This function loads all test cases, runs inference concurrently (max 5),
+    scores results, and persists aggregated metrics. Designed to be called as
+    a background task. Always creates its own DB session.
+    """
+    async with async_session() as session:
+        await _execute_backtest(session, backtest_run_id)
+
+
+async def _execute_backtest(db: AsyncSession, backtest_run_id: str) -> None:
+    run = await db.get(BacktestRun, backtest_run_id)
+    if not run:
+        logger.error("BacktestRun %s not found", backtest_run_id)
+        return
+
+    # Mark as running
+    run.status = "running"
+    run.started_at = datetime.now(timezone.utc)
+    await db.commit()
+
+    pass_threshold = run.pass_threshold if run.pass_threshold is not None else 0.5
+
+    try:
+        prompt_version = await db.get(PromptVersion, run.prompt_version_id)
+        model_config = await db.get(ModelConfig, run.model_config_id)
+
+        if not prompt_version or not model_config:
+            run.status = "failed"
+            run.error_message = "Invalid prompt version or model config"
+            run.completed_at = datetime.now(timezone.utc)
+            await db.commit()
+            return
+
+        # Load test case result stubs (already created by router)
+        result_rows = await db.execute(
+            select(BacktestResult).where(BacktestResult.backtest_run_id == backtest_run_id)
+        )
+        result_list = list(result_rows.scalars().all())
+
+        if not result_list:
+            run.status = "completed"
+            run.completed_at = datetime.now(timezone.utc)
+            await db.commit()
+            return
+
+        api_key = decrypt_api_key(model_config.api_key_encrypted) if model_config.api_key_encrypted else None
+        provider = get_provider(model_config.provider, api_key=api_key, base_url=model_config.base_url)
+
+        # Optional LLM-as-judge (for both legacy whole-output grading and llm_judge assertions)
+        judge_model = None
+        judge_provider = None
+        if run.judge_model_config_id:
+            judge_model = await db.get(ModelConfig, run.judge_model_config_id)
+            if judge_model:
+                logger.info("Using judge model %s for grading", judge_model.name)
+                judge_api_key = decrypt_api_key(judge_model.api_key_encrypted) if judge_model.api_key_encrypted else None
+                judge_provider = get_provider(
+                    judge_model.provider,
+                    api_key=judge_api_key,
+                    base_url=judge_model.base_url,
+                )
+
+        # Snapshot everything run_single needs as plain Python data — no
+        # ORM objects leak across sessions.  This is what fixes the
+        # PendingRollbackError storms we were seeing: each concurrent
+        # run_single opens its own AsyncSession so a failure in one doesn't
+        # poison another's session.
+        run_snapshot = {
+            "prompt_version_id": run.prompt_version_id,
+            "model_config_id": run.model_config_id,
+            "judge_model_config_id": run.judge_model_config_id,
+        }
+        model_cfg_snapshot = {
+            "id": model_config.id,
+            "name": model_config.name,
+            "provider": model_config.provider,
+            "model_id": model_config.model_id,
+            "temperature": model_config.temperature,
+            "extra_params": dict(model_config.extra_params or {}),
+            "adapter_path": model_config.adapter_path,
+            "api_key_encrypted": model_config.api_key_encrypted,
+            "base_url": model_config.base_url,
+        }
+        prompt_snapshot = {
+            "system_message": prompt_version.system_message,
+            "content": prompt_version.content,
+        }
+        judge_snapshot = None
+        if judge_model:
+            judge_snapshot = {
+                "id": judge_model.id,
+                "provider": judge_model.provider,
+                "model_id": judge_model.model_id,
+                "api_key_encrypted": judge_model.api_key_encrypted,
+                "base_url": judge_model.base_url,
+                "extra_params": dict(judge_model.extra_params or {}),
+            }
+        result_ids = [r.id for r in result_list]
+
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+
+        async def run_single(result_id: str) -> dict:
+            """Inference under the semaphore; DB write serialized by _DB_WRITE_LOCK."""
+            async with semaphore:
+                try:
+                    outcome = await _run_single_case(
+                        result_id,
+                        run_snapshot,
+                        prompt_snapshot,
+                        model_cfg_snapshot,
+                        judge_snapshot,
+                        pass_threshold,
+                    )
+                except Exception as e:
+                    logger.exception("run_single crashed for result %s", result_id)
+                    outcome = {
+                        "result_id": result_id,
+                        "status": "error",
+                        "error_message": f"run_single crashed: {e}"[:500],
+                        "pass_score": None,
+                        "assertion_results_json": None,
+                        "actual_output": None,
+                        "latency_ms": 0,
+                        "cache_hit": False,
+                    }
+
+            # Serialized write-back — only one session commits at a time across
+            # all concurrent run_single coroutines.
+            async with _DB_WRITE_LOCK:
+                async with async_session() as write_db:
+                    row = await write_db.get(BacktestResult, result_id)
+                    if row is None:
+                        logger.error("BacktestResult %s disappeared before write", result_id)
+                        return outcome
+                    row.status = outcome["status"]
+                    row.pass_score = outcome["pass_score"]
+                    row.assertion_results = outcome["assertion_results_json"]
+                    row.actual_output = outcome["actual_output"]
+                    row.latency_ms = outcome["latency_ms"]
+                    row.cache_hit = outcome["cache_hit"]
+                    if outcome.get("error_message"):
+                        row.error_message = outcome["error_message"]
+                    await write_db.commit()
+            return outcome
+
+        await asyncio.gather(*[run_single(rid) for rid in result_ids])
+
+        # Reload results in this session to aggregate — each child committed in its own session
+        await db.commit()  # release any locks on our side first
+        await db.refresh(run)
+        agg_rows = await db.execute(
+            select(BacktestResult).where(BacktestResult.backtest_run_id == backtest_run_id)
+        )
+        fresh_results = list(agg_rows.scalars().all())
+        passed = sum(1 for r in fresh_results if r.status == "passed")
+        failed = sum(1 for r in fresh_results if r.status in ("failed", "error"))
+        scored = passed + failed
+        total = len(fresh_results)
+
+        run.passed_cases = passed
+        run.failed_cases = failed
+        run.total_cases = total
+        run.pass_rate = (passed / scored) if scored > 0 else None
+        run.status = "completed"
+        run.completed_at = datetime.now(timezone.utc)
+        await db.commit()
+        no_judge = total - scored
+        logger.info(
+            "Backtest %s completed: %d/%d passed (%s%%) — %d no-judgment cases [threshold=%.0f%%]",
+            backtest_run_id, passed, scored,
+            f"{(run.pass_rate or 0) * 100:.1f}" if scored else "n/a",
+            no_judge, pass_threshold * 100,
+        )
+
+    except Exception as e:
+        logger.exception("Backtest run %s failed unexpectedly", backtest_run_id)
+        try:
+            run.status = "failed"
+            run.error_message = str(e)
+            run.completed_at = datetime.now(timezone.utc)
+            await db.commit()
+        except Exception:
+            pass
+
+
+# ─── Per-case inference + scoring (runs in its own session) ─────────────────
+
+async def _run_single_case(
+    result_id: str,
+    run_snap: dict,
+    prompt_snap: dict,
+    model_snap: dict,
+    judge_snap: dict | None,
+    run_threshold: float,
+) -> dict:
+    """Execute one test case end-to-end.  Returns a dict describing the outcome.
+
+    Inference + scoring happen WITHOUT holding any DB session.  Only the two
+    bracketing DB operations take sessions:
+      • read phase: load test_case + document (fast, short-lived session)
+      • write phase: update BacktestResult (held under _DB_WRITE_LOCK in caller)
+    """
+    # ── Read phase: load test case + document, then release session ────
+    async with async_session() as read_db:
+        res = await read_db.get(BacktestResult, result_id)
+        if not res:
+            return {"result_id": result_id, "status": "error",
+                    "error_message": "BacktestResult disappeared"}
+        test_case = await read_db.get(TestCase, res.test_case_id)
+        if not test_case:
+            return {"result_id": result_id, "status": "error",
+                    "error_message": "Test case not found"}
+        tc_id = test_case.id
+        tc_input = test_case.input_text
+        tc_expected = test_case.expected_output or ""
+        tc_expected_type = test_case.expected_type
+        tc_document_id = test_case.document_id
+        tc_assertions_json = test_case.assertions
+        tc_pass_threshold = test_case.pass_threshold
+        tc_name = test_case.name
+        document_raw = None
+        if tc_document_id:
+            doc = await read_db.get(Document, tc_document_id)
+            if doc:
+                document_raw = doc.raw_text
+
+    # ── Inference phase (no DB session) ────────────────────────────────
+    messages: list[dict] = []
+    if prompt_snap["system_message"]:
+        messages.append({"role": "system", "content": prompt_snap["system_message"]})
+    user_content = prompt_snap["content"]
+    if document_raw:
+        user_content += f"\n\n--- Document Content ---\n{document_raw}"
+    if tc_input:
+        user_content += f"\n\n--- User Input ---\n{tc_input}"
+    messages.append({"role": "user", "content": user_content})
+
+    api_key = decrypt_api_key(model_snap["api_key_encrypted"]) if model_snap["api_key_encrypted"] else None
+    provider = get_provider(model_snap["provider"], api_key=api_key, base_url=model_snap["base_url"])
+
+    judge_model_obj = None
+    judge_provider = None
+    if judge_snap:
+        class _JudgeShim:
+            pass
+        judge_model_obj = _JudgeShim()
+        for k, v in judge_snap.items():
+            setattr(judge_model_obj, k, v)
+        judge_api_key = decrypt_api_key(judge_snap["api_key_encrypted"]) if judge_snap["api_key_encrypted"] else None
+        judge_provider = get_provider(judge_snap["provider"], api_key=judge_api_key, base_url=judge_snap["base_url"])
+
+    extra_params = dict(model_snap["extra_params"] or {})
+    if model_snap.get("adapter_path"):
+        extra_params.setdefault("adapter_path", model_snap["adapter_path"])
+
+    start = time.monotonic()
+    cache_hit = False
+    actual = None
+    elapsed_ms = 0
+    error_message = None
+    pass_score: float | None = None
+    assertion_results_json: str | None = None
+    status = "pending"
+
+    try:
+        # ── Try inference cache (read-only, short session) ──
+        async with _DB_WRITE_LOCK:
+            async with async_session() as cache_db:
+                cached = await _lookup_cache(
+                    cache_db,
+                    prompt_version_id=run_snap["prompt_version_id"],
+                    model_config_id=run_snap["model_config_id"],
+                    test_case_id=tc_id,
+                    document_id=tc_document_id,
+                    max_tokens=DEFAULT_MAX_TOKENS,
+                    temperature=model_snap["temperature"],
+                )
+                if cached is not None:
+                    actual = cached.output
+                    elapsed_ms = cached.latency_ms or 0
+                    cache_hit = True
+
+        # ── Call the model (slow — happens outside any lock) ──
+        if actual is None:
+            response = await provider.generate(
+                messages=messages,
+                model_id=model_snap["model_id"],
+                max_tokens=DEFAULT_MAX_TOKENS,
+                temperature=model_snap["temperature"],
+                **extra_params,
+            )
+            elapsed_ms = int((time.monotonic() - start) * 1000)
+            actual = response.content
+
+            # Store to cache (write under lock)
+            async with _DB_WRITE_LOCK:
+                async with async_session() as cache_db:
+                    await _store_cache(
+                        cache_db,
+                        prompt_version_id=run_snap["prompt_version_id"],
+                        model_config_id=run_snap["model_config_id"],
+                        test_case_id=tc_id,
+                        document_id=tc_document_id,
+                        max_tokens=DEFAULT_MAX_TOKENS,
+                        temperature=model_snap["temperature"],
+                        output=actual,
+                        latency_ms=elapsed_ms,
+                    )
+                    await cache_db.commit()
+
+        # ── Score the output (no DB needed — pure compute) ──
+        tc_threshold = tc_pass_threshold if tc_pass_threshold is not None else run_threshold
+        assertion_specs: list[dict] = []
+        if tc_assertions_json:
+            try:
+                assertion_specs = json.loads(tc_assertions_json) or []
+            except Exception:
+                assertion_specs = []
+        has_expected = bool(tc_expected.strip())
+
+        if assertion_specs:
+            results_list, overall_score, _ = await assertion_engine.run_assertions(
+                assertion_specs, actual, tc_expected,
+                judge_provider=judge_provider, judge_model=judge_model_obj,
+            )
+            assertion_results_json = json.dumps(results_list)
+            pass_score = overall_score
+            status = "passed" if overall_score >= tc_threshold else "failed"
+        elif has_expected and judge_model_obj is not None:
+            score, reasoning = await _score_with_judge(
+                judge_model_obj, tc_input, tc_expected, actual, tc_expected_type,
+            )
+            if reasoning:
+                error_message = f"[judge] {reasoning}"
+            pass_score = score
+            status = "passed" if score >= tc_threshold else "failed"
+        elif has_expected:
+            score = compute_score(tc_expected, actual, tc_expected_type)
+            pass_score = score
+            status = "passed" if score >= tc_threshold else "failed"
+        else:
+            status = "no_judgment"
+
+        logger.debug("Test case %s: status=%s score=%s (cache=%s)",
+                     tc_name, status, pass_score, cache_hit)
+    except Exception as e:
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        status = "error"
+        error_message = str(e)[:500]
+        logger.warning("Backtest case %s failed: %s", result_id, e)
+
+    return {
+        "result_id": result_id,
+        "status": status,
+        "pass_score": pass_score,
+        "assertion_results_json": assertion_results_json,
+        "actual_output": actual,
+        "latency_ms": elapsed_ms,
+        "cache_hit": cache_hit,
+        "error_message": error_message,
+    }
+
+
+
+
+# ─── Inference cache helpers ────────────────────────────────────────────────
+
+
+async def _lookup_cache(
+    db: AsyncSession,
+    *,
+    prompt_version_id: str,
+    model_config_id: str,
+    test_case_id: str,
+    document_id: str | None,
+    max_tokens: int,
+    temperature: float,
+) -> InferenceCache | None:
+    """Return the cached InferenceCache row for this key, or None."""
+    from sqlalchemy import and_
+    q = select(InferenceCache).where(and_(
+        InferenceCache.prompt_version_id == prompt_version_id,
+        InferenceCache.model_config_id == model_config_id,
+        InferenceCache.test_case_id == test_case_id,
+        InferenceCache.max_tokens == max_tokens,
+        InferenceCache.temperature == temperature,
+    ))
+    if document_id is None:
+        q = q.where(InferenceCache.document_id.is_(None))
+    else:
+        q = q.where(InferenceCache.document_id == document_id)
+    r = await db.execute(q)
+    return r.scalars().first()
+
+
+async def _store_cache(
+    db: AsyncSession,
+    *,
+    prompt_version_id: str,
+    model_config_id: str,
+    test_case_id: str,
+    document_id: str | None,
+    max_tokens: int,
+    temperature: float,
+    output: str,
+    latency_ms: int,
+) -> None:
+    """Upsert a cache entry.  Silently ignores on race conditions."""
+    try:
+        entry = InferenceCache(
+            prompt_version_id=prompt_version_id,
+            model_config_id=model_config_id,
+            test_case_id=test_case_id,
+            document_id=document_id,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            output=output,
+            latency_ms=latency_ms,
+        )
+        db.add(entry)
+        await db.flush()
+    except Exception as e:
+        logger.debug("Cache store skipped: %s", e)

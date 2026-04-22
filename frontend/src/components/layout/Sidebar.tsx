@@ -100,6 +100,7 @@ export function Sidebar() {
       <NavSection>
         <NavLabel>Workspace</NavLabel>
         <StyledNavLink to="/projects" end>Projects</StyledNavLink>
+        <StyledNavLink to="/chat">Chat</StyledNavLink>
         <StyledNavLink to="/knowledge-base">Knowledge Base</StyledNavLink>
       </NavSection>
 

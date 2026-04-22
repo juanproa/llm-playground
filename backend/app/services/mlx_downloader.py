@@ -239,8 +239,10 @@ def download_model(model_id: str, revision: str = "main") -> Path:
             continue
 
         url = f"https://huggingface.co/{model_id}/resolve/{revision}/{path}"
+        # Bind the logical path so progress_cb receives it instead of the blob SHA
+        per_file_cb = lambda _blob_name, cur, total, _path=path: progress_cb(_path, cur, total)
         try:
-            _download_single_file(url, blob, size, on_progress=progress_cb)
+            _download_single_file(url, blob, size, on_progress=per_file_cb)
         except Exception as e:
             _PROGRESS[model_id] = {
                 "state": "error",

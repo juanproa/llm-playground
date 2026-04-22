@@ -75,6 +75,15 @@ KNOWN_MLX_MODELS: list[MlxModel] = [
         hf_original="Qwen/Qwen2.5-3B-Instruct",
     ),
     MlxModel(
+        id="mlx-community/Qwen2.5-3B-Instruct-bf16",
+        name="Qwen 2.5 3B Instruct (bf16, full precision)",
+        size="3B",
+        family="qwen",
+        quantization="bf16",
+        hf_original="Qwen/Qwen2.5-3B-Instruct",
+        notes="Full-precision bf16 — higher quality, ~6.5 GB, needs 8+ GB RAM.",
+    ),
+    MlxModel(
         id="mlx-community/Qwen2.5-7B-Instruct-4bit",
         name="Qwen 2.5 7B Instruct (4-bit)",
         size="7B",

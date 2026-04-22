@@ -332,3 +332,30 @@ export interface KnowledgeBaseItem {
 export interface KnowledgeBaseWithItems extends KnowledgeBase {
   items: KnowledgeBaseItem[];
 }
+
+// ─── Chat ────────────────────────────────────────────────────────────────────
+
+export interface ChatSession {
+  id: string;
+  name: string;
+  model_config_id: string;
+  system_prompt: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ChatMessage {
+  id: string;
+  session_id: string;
+  role: 'user' | 'assistant' | 'system';
+  content: string;
+  tokens_in: number | null;
+  tokens_out: number | null;
+  latency_ms: number | null;
+  error_message: string | null;
+  created_at: string;
+}
+
+export interface ChatSessionWithMessages extends ChatSession {
+  messages: ChatMessage[];
+}

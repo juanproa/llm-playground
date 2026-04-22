@@ -8,7 +8,7 @@ from sqlalchemy import text
 
 from app.config import settings
 from app.database import Base, engine
-from app.routers import health, projects, prompts, documents, models, inference, post_training, knowledge_base
+from app.routers import health, projects, prompts, documents, models, inference, post_training, knowledge_base, chat
 
 # Import post-training models so Base.metadata.create_all picks them up
 from app.models.post_training import (  # noqa: F401
@@ -25,6 +25,7 @@ from app.models.post_training import (  # noqa: F401
     ComparisonRun,
 )
 from app.models.knowledge_base import KnowledgeBase, KnowledgeBaseItem  # noqa: F401
+from app.models.chat import ChatSession, ChatMessage  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -85,3 +86,4 @@ app.include_router(models.router, prefix="/api/v1")
 app.include_router(inference.router, prefix="/api/v1")
 app.include_router(post_training.router, prefix="/api/v1")
 app.include_router(knowledge_base.router, prefix="/api/v1")
+app.include_router(chat.router, prefix="/api/v1")

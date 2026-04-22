@@ -18,6 +18,7 @@ from app.models.post_training import (
     ComparisonRun,
 )
 from app.models.knowledge_base import KnowledgeBase, KnowledgeBaseItem
+from app.models.chat import ChatSession, ChatMessage
 
 __all__ = [
     "Project",
@@ -42,4 +43,6 @@ __all__ = [
     "ComparisonRun",
     "KnowledgeBase",
     "KnowledgeBaseItem",
+    "ChatSession",
+    "ChatMessage",
 ]

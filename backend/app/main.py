@@ -8,7 +8,7 @@ from sqlalchemy import text
 
 from app.config import settings
 from app.database import Base, engine
-from app.routers import health, projects, prompts, documents, models, inference, post_training, knowledge_base, chat
+from app.routers import health, projects, prompts, documents, models, inference, post_training, knowledge_base, chat, input_datasets
 
 # Import post-training models so Base.metadata.create_all picks them up
 from app.models.post_training import (  # noqa: F401
@@ -24,7 +24,8 @@ from app.models.post_training import (  # noqa: F401
     InferenceCache,
     ComparisonRun,
 )
-from app.models.knowledge_base import KnowledgeBase, KnowledgeBaseItem  # noqa: F401
+from app.models.knowledge_base import KnowledgeBase, KnowledgeBaseItem, KnowledgeBaseChunk  # noqa: F401
+from app.models.input_dataset import InputDataset, InputDatasetItem  # noqa: F401
 from app.models.chat import ChatSession, ChatMessage  # noqa: F401
 
 logger = logging.getLogger(__name__)
@@ -41,6 +42,29 @@ def _run_migrations(conn) -> None:
         ("pt_test_cases", "source_kb_item_id", "ALTER TABLE pt_test_cases ADD COLUMN source_kb_item_id VARCHAR(36)"),
         ("pt_backtest_results", "assertion_results", "ALTER TABLE pt_backtest_results ADD COLUMN assertion_results TEXT"),
         ("pt_backtest_results", "cache_hit", "ALTER TABLE pt_backtest_results ADD COLUMN cache_hit BOOLEAN DEFAULT 0"),
+        # Knowledge Base RAG columns — added when RAG support was introduced.
+        ("knowledge_bases", "embedding_provider", "ALTER TABLE knowledge_bases ADD COLUMN embedding_provider VARCHAR(50) DEFAULT 'mlx_local'"),
+        ("knowledge_bases", "embedding_model", "ALTER TABLE knowledge_bases ADD COLUMN embedding_model VARCHAR(255) DEFAULT 'mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ'"),
+        ("knowledge_bases", "embedding_dim", "ALTER TABLE knowledge_bases ADD COLUMN embedding_dim INTEGER"),
+        ("knowledge_bases", "chunk_size_tokens", "ALTER TABLE knowledge_bases ADD COLUMN chunk_size_tokens INTEGER DEFAULT 800"),
+        ("knowledge_bases", "chunk_overlap_tokens", "ALTER TABLE knowledge_bases ADD COLUMN chunk_overlap_tokens INTEGER DEFAULT 100"),
+        ("knowledge_bases", "chunk_count", "ALTER TABLE knowledge_bases ADD COLUMN chunk_count INTEGER DEFAULT 0"),
+        ("knowledge_bases", "dictionary_content", "ALTER TABLE knowledge_bases ADD COLUMN dictionary_content TEXT"),
+        ("knowledge_bases", "dictionary_filename", "ALTER TABLE knowledge_bases ADD COLUMN dictionary_filename VARCHAR(500)"),
+        ("knowledge_base_items", "metadata_json", "ALTER TABLE knowledge_base_items ADD COLUMN metadata_json TEXT"),
+        ("knowledge_base_items", "embedding_status", "ALTER TABLE knowledge_base_items ADD COLUMN embedding_status VARCHAR(20) DEFAULT 'pending'"),
+        ("knowledge_base_items", "embedding_error", "ALTER TABLE knowledge_base_items ADD COLUMN embedding_error TEXT"),
+        ("knowledge_base_items", "parse_status", "ALTER TABLE knowledge_base_items ADD COLUMN parse_status VARCHAR(20) DEFAULT 'ready'"),
+        ("knowledge_base_items", "parse_error", "ALTER TABLE knowledge_base_items ADD COLUMN parse_error TEXT"),
+        # Prompt-version RAG defaults
+        ("prompt_versions", "kb_id", "ALTER TABLE prompt_versions ADD COLUMN kb_id VARCHAR(36)"),
+        ("prompt_versions", "kb_top_k", "ALTER TABLE prompt_versions ADD COLUMN kb_top_k INTEGER DEFAULT 5"),
+        # InputDatasetItem PDF support
+        ("input_dataset_items", "source_type", "ALTER TABLE input_dataset_items ADD COLUMN source_type VARCHAR(50) DEFAULT 'text'"),
+        ("input_dataset_items", "mime_type", "ALTER TABLE input_dataset_items ADD COLUMN mime_type VARCHAR(100)"),
+        ("input_dataset_items", "file_size_bytes", "ALTER TABLE input_dataset_items ADD COLUMN file_size_bytes INTEGER"),
+        ("input_dataset_items", "parse_status", "ALTER TABLE input_dataset_items ADD COLUMN parse_status VARCHAR(20) DEFAULT 'ready'"),
+        ("input_dataset_items", "parse_error", "ALTER TABLE input_dataset_items ADD COLUMN parse_error TEXT"),
     ]
     for table, column, ddl in migrations:
         try:
@@ -86,4 +110,5 @@ app.include_router(models.router, prefix="/api/v1")
 app.include_router(inference.router, prefix="/api/v1")
 app.include_router(post_training.router, prefix="/api/v1")
 app.include_router(knowledge_base.router, prefix="/api/v1")
+app.include_router(input_datasets.router, prefix="/api/v1")
 app.include_router(chat.router, prefix="/api/v1")

@@ -12,6 +12,7 @@ import { ModelFusionPage } from './pages/ModelFusionPage';
 import { BatchComparePage } from './pages/BatchComparePage';
 import { ChatPage } from './pages/ChatPage';
 import { KnowledgeBasePage } from './pages/KnowledgeBasePage';
+import { DatasetsPage } from './pages/DatasetsPage';
 import { ModelRegistryPage } from './pages/ModelRegistryPage';
 import { SettingsPage } from './pages/SettingsPage';
 
@@ -37,6 +38,7 @@ export function App() {
               <Route path="/projects/:projectId/post-training" element={<PostTrainingPage />} />
               <Route path="/model-fusion" element={<ModelFusionPage />} />
               <Route path="/knowledge-base" element={<KnowledgeBasePage />} />
+              <Route path="/datasets" element={<DatasetsPage />} />
               <Route path="/chat" element={<ChatPage />} />
               <Route path="/models" element={<ModelRegistryPage />} />
               <Route path="/settings" element={<SettingsPage />} />

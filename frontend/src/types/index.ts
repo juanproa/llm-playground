@@ -15,6 +15,8 @@ export interface PromptVersion {
   content: string;
   system_message: string | null;
   is_active: boolean;
+  kb_id: string | null;
+  kb_top_k: number;
   created_at: string;
 }
 
@@ -311,6 +313,13 @@ export interface KnowledgeBase {
   name: string;
   description: string | null;
   item_count: number;
+  embedding_provider: string;
+  embedding_model: string;
+  embedding_dim: number | null;
+  chunk_size_tokens: number;
+  chunk_overlap_tokens: number;
+  chunk_count: number;
+  dictionary_filename: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -325,12 +334,75 @@ export interface KnowledgeBaseItem {
   source_filename: string | null;
   mime_type: string | null;
   file_size_bytes: number | null;
+  metadata_json: string | null;
+  parse_status: string;
+  parse_error: string | null;
+  embedding_status: string;
+  embedding_error: string | null;
   created_at: string;
   updated_at: string;
 }
 
 export interface KnowledgeBaseWithItems extends KnowledgeBase {
   items: KnowledgeBaseItem[];
+  dictionary_content: string | null;
+}
+
+export interface EmbeddingModelInfo {
+  provider: string;
+  model_id: string;
+  display_name: string;
+  dim: number | null;
+  notes: string | null;
+}
+
+export interface RetrievedChunk {
+  chunk_id: string;
+  item_id: string;
+  item_name: string;
+  source_type: string;
+  chunk_index: number;
+  content: string;
+  score: number;
+  metadata: Record<string, unknown> | null;
+}
+
+export interface KbQueryResponse {
+  query: string;
+  embedding_model: string;
+  chunks: RetrievedChunk[];
+  dictionary_content: string | null;
+}
+
+// ─── Input Datasets (global, for Workspace prompt-input browsing) ───────────
+
+export interface InputDataset {
+  id: string;
+  name: string;
+  description: string | null;
+  item_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface InputDatasetItem {
+  id: string;
+  dataset_id: string;
+  name: string | null;
+  content: string;
+  tags: string | null;
+  metadata_json: string | null;
+  source_type: string;
+  source_filename: string | null;
+  mime_type: string | null;
+  file_size_bytes: number | null;
+  parse_status: string;
+  parse_error: string | null;
+  created_at: string;
+}
+
+export interface InputDatasetWithItems extends InputDataset {
+  items: InputDatasetItem[];
 }
 
 // ─── Chat ────────────────────────────────────────────────────────────────────

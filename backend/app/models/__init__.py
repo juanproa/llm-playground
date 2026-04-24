@@ -17,7 +17,8 @@ from app.models.post_training import (
     InferenceCache,
     ComparisonRun,
 )
-from app.models.knowledge_base import KnowledgeBase, KnowledgeBaseItem
+from app.models.knowledge_base import KnowledgeBase, KnowledgeBaseItem, KnowledgeBaseChunk
+from app.models.input_dataset import InputDataset, InputDatasetItem
 from app.models.chat import ChatSession, ChatMessage
 
 __all__ = [
@@ -43,6 +44,9 @@ __all__ = [
     "ComparisonRun",
     "KnowledgeBase",
     "KnowledgeBaseItem",
+    "KnowledgeBaseChunk",
+    "InputDataset",
+    "InputDatasetItem",
     "ChatSession",
     "ChatMessage",
 ]

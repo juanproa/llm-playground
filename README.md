@@ -8,7 +8,7 @@ A Python-based platform for experimenting with and improving LLMs. Built with pr
 - **Frontend**: React + TypeScript + Vite + styled-components
 - **LLM Providers**: Anthropic Claude, OpenAI, Google Gemini, Ollama (local)
 - **PDF Parsing**: Docling + Tesseract + pdf2image
-- **Design System**: NorthFirst.ai dark theme (Comfortaa, Manrope, Poppins)
+- **Design System**: Dark theme (Comfortaa, Manrope, Poppins)
 
 ## Quick Start
 

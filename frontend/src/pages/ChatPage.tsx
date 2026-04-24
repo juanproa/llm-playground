@@ -7,7 +7,6 @@ import styled from 'styled-components';
 import { tokens } from '../theme/tokens';
 import { TopBar } from '../components/layout/TopBar';
 import { Button } from '../components/common/Button';
-import { Badge } from '../components/common/Badge';
 import { chatApi } from '../api/chat';
 import { useModelStore } from '../stores/modelStore';
 import { useChatStream, mergeMessages, type StreamingMessage } from '../hooks/useChatStream';

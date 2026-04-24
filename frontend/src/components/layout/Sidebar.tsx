@@ -17,14 +17,6 @@ const BrandArea = styled.div`
   margin-bottom: ${tokens.spacing.md};
 `;
 
-const NorthFirstLogo = styled.img`
-  display: block;
-  height: 18px;
-  width: auto;
-  margin-bottom: 14px;
-  opacity: 0.7;
-`;
-
 const AppName = styled.div`
   font-family: ${tokens.fonts.display};
   font-size: 1.15rem;
@@ -93,7 +85,6 @@ export function Sidebar() {
   return (
     <SidebarContainer>
       <BrandArea>
-        <NorthFirstLogo src="/northfirst-logo.svg" alt="NorthFirst.ai" />
         <AppName><AppNameAccent>LLM</AppNameAccent> Playground</AppName>
       </BrandArea>
 
@@ -101,7 +92,8 @@ export function Sidebar() {
         <NavLabel>Workspace</NavLabel>
         <StyledNavLink to="/projects" end>Projects</StyledNavLink>
         <StyledNavLink to="/chat">Chat</StyledNavLink>
-        <StyledNavLink to="/knowledge-base">Knowledge Base</StyledNavLink>
+        <StyledNavLink to="/datasets">Datasets</StyledNavLink>
+        <StyledNavLink to="/knowledge-base">Knowledge Base &amp; RAG</StyledNavLink>
       </NavSection>
 
       <NavSection>

@@ -106,37 +106,57 @@ class MlxLmBackend(TrainingBackend):
         items_ordered = list(dataset_items)
         rng = random.Random(42)
         rng.shuffle(items_ordered)
-        n_val = max(1, int(len(items_ordered) * val_split)) if val_split > 0 else 0
+        if val_split > 0 and len(items_ordered) >= 2:
+            n_val = min(len(items_ordered) - 1, max(1, int(len(items_ordered) * val_split)))
+        else:
+            n_val = 0
         val_items = items_ordered[:n_val]
         train_items = items_ordered[n_val:]
 
         def _write_jsonl(path: Path, items: list):
+            # mlx_lm expects one of its native formats (chat/completions/text).
+            # We emit the `chat` format so system messages are handled cleanly.
             with open(path, "w", encoding="utf-8") as f:
                 for item in items:
-                    record: dict = {"output": item.output_text}
+                    user_parts: list[str] = []
                     if item.instruction:
-                        record["instruction"] = item.instruction
+                        user_parts.append(item.instruction)
                     if item.input_text:
-                        record["input"] = item.input_text
+                        user_parts.append(item.input_text)
+                    user_content = "\n\n".join(user_parts) if user_parts else ""
+                    messages: list[dict] = []
                     if item.system_message:
-                        record["system"] = item.system_message
-                    f.write(json.dumps(record) + "\n")
+                        messages.append({"role": "system", "content": item.system_message})
+                    messages.append({"role": "user", "content": user_content})
+                    messages.append({"role": "assistant", "content": item.output_text})
+                    f.write(json.dumps({"messages": messages}) + "\n")
 
         _write_jsonl(train_file, train_items)
         if val_items:
             _write_jsonl(valid_file, val_items)
+        else:
+            # mlx_lm.lora always loads valid.jsonl — provide an empty file
+            # when we skipped validation to avoid a "file not found" error.
+            valid_file.write_text("")
+
+        # mlx_lm uses --iters (total optimizer steps), not epochs.  Convert.
+        steps_per_epoch = max(1, (len(train_items) + batch_size - 1) // batch_size)
+        iters = max(1, epochs * steps_per_epoch)
 
         cmd = [
-            "python", "-m", "mlx_lm.lora",
+            "python", "-m", "mlx_lm", "lora",
             "--model", job.base_model,
             "--train",
             "--data", str(job_dir),
-            "--num-epochs", str(epochs),
+            "--iters", str(iters),
             "--learning-rate", str(lr),
             "--batch-size", str(batch_size),
             "--max-seq-length", str(max_seq_length),
             "--adapter-path", str(output_dir),
         ]
+        if not val_items:
+            # No validation data; disable periodic eval
+            cmd.extend(["--val-batches", "-1"])
 
         logger.info("Starting mlx_lm training: %s", " ".join(cmd))
 

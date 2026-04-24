@@ -7,6 +7,13 @@ class InferenceRequest(BaseModel):
     model_config_id: str
     document_id: str | None = None
     input_text: str = ""
+    # Optional RAG override — when the request sets `kb_id` / `kb_top_k`, they
+    # take precedence. Otherwise the backend falls back to the prompt
+    # version's kb_id / kb_top_k. Pass `rag_override_none=true` to explicitly
+    # disable RAG for this call even if the prompt has a bound KB.
+    kb_id: str | None = None
+    kb_top_k: int | None = None
+    rag_override_none: bool = False
 
 
 class InferenceRunResponse(BaseModel):

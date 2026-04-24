@@ -4,16 +4,12 @@ import { tokens } from '../theme/tokens';
 import { Button } from '../components/common/Button';
 import { Badge } from '../components/common/Badge';
 import { TopBar } from '../components/layout/TopBar';
-import { knowledgeBaseApi } from '../api/knowledgeBase';
 import { inputDatasetsApi } from '../api/inputDatasets';
 import type {
-  EmbeddingModelInfo,
-  KnowledgeBase,
-  KnowledgeBaseItem,
-  KnowledgeBaseWithItems,
+  InputDataset,
+  InputDatasetItem,
+  InputDatasetWithItems,
 } from '../types';
-
-/* ── Layout ── */
 
 const Page = styled.div`
   display: grid;
@@ -54,8 +50,6 @@ const PanelBody = styled.div`
   padding: ${tokens.spacing.md};
 `;
 
-/* ── Cards ── */
-
 const Card = styled.div<{ $selected?: boolean }>`
   padding: 10px 12px;
   background: ${({ $selected }) => $selected ? 'rgba(108, 92, 231, 0.12)' : tokens.colors.bg.tertiary};
@@ -87,8 +81,6 @@ const Row = styled.div`
   gap: 8px;
   justify-content: space-between;
 `;
-
-/* ── Forms ── */
 
 const FormGroup = styled.div`
   display: flex;
@@ -191,51 +183,38 @@ const ErrorText = styled.div`
   padding: 8px 12px;
 `;
 
-/* ── Component ── */
+type AddTab = 'text' | 'pdf' | 'batch' | 'csv';
 
-type AddTab = 'text' | 'pdf' | 'batch' | 'csv' | 'dictionary';
-
-const DEFAULT_EMBED_PROVIDER = 'mlx_local';
-const DEFAULT_EMBED_MODEL = 'mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ';
-
-export function KnowledgeBasePage() {
-  const [kbs, setKbs] = useState<KnowledgeBase[]>([]);
-  const [selected, setSelected] = useState<KnowledgeBaseWithItems | null>(null);
+export function DatasetsPage() {
+  const [datasets, setDatasets] = useState<InputDataset[]>([]);
+  const [selected, setSelected] = useState<InputDatasetWithItems | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [expandedItemId, setExpandedItemId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [embeddingModels, setEmbeddingModels] = useState<EmbeddingModelInfo[]>([]);
-  const [reindexing, setReindexing] = useState(false);
 
-  // Create/Edit KB form
-  const [showKbForm, setShowKbForm] = useState(false);
-  const [editingKb, setEditingKb] = useState<KnowledgeBase | null>(null);
-  const [kbName, setKbName] = useState('');
-  const [kbDesc, setKbDesc] = useState('');
-  const [kbEmbedKey, setKbEmbedKey] = useState<string>(`${DEFAULT_EMBED_PROVIDER}::${DEFAULT_EMBED_MODEL}`);
+  const [showForm, setShowForm] = useState(false);
+  const [editing, setEditing] = useState<InputDataset | null>(null);
+  const [name, setName] = useState('');
+  const [desc, setDesc] = useState('');
 
-  // Add-item tabs
   const [addTab, setAddTab] = useState<AddTab>('text');
-
-  // Text item form
   const [itemName, setItemName] = useState('');
-  const [itemDesc, setItemDesc] = useState('');
+  const [itemTags, setItemTags] = useState('');
   const [itemContent, setItemContent] = useState('');
 
-  // PDF uploads
-  const [pdfDesc, setPdfDesc] = useState('');
-  const [uploading, setUploading] = useState(false);
   const [csvContentColumn, setCsvContentColumn] = useState('');
   const [csvNameColumn, setCsvNameColumn] = useState('');
-  const singleFileRef = useRef<HTMLInputElement>(null);
-  const batchFileRef = useRef<HTMLInputElement>(null);
-  const csvFileRef = useRef<HTMLInputElement>(null);
-  const dictFileRef = useRef<HTMLInputElement>(null);
+  const [pdfName, setPdfName] = useState('');
+  const [pdfTags, setPdfTags] = useState('');
+  const [uploading, setUploading] = useState(false);
+  const csvRef = useRef<HTMLInputElement>(null);
+  const pdfRef = useRef<HTMLInputElement>(null);
+  const batchPdfRef = useRef<HTMLInputElement>(null);
 
-  const loadKbs = useCallback(async () => {
+  const loadAll = useCallback(async () => {
     try {
-      const list = await knowledgeBaseApi.list();
-      setKbs(list);
+      const list = await inputDatasetsApi.list();
+      setDatasets(list);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to load');
     }
@@ -243,33 +222,26 @@ export function KnowledgeBasePage() {
 
   const loadSelected = useCallback(async (id: string) => {
     try {
-      const full = await knowledgeBaseApi.get(id);
+      const full = await inputDatasetsApi.get(id);
       setSelected(full);
       setSelectedId(id);
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to load KB');
+      setError(e instanceof Error ? e.message : 'Failed');
     }
   }, []);
 
   useEffect(() => {
-    loadKbs();
-    knowledgeBaseApi
-      .listEmbeddingModels()
-      .then(setEmbeddingModels)
-      .catch(() => setEmbeddingModels([]));
-  }, [loadKbs]);
+    loadAll();
+  }, [loadAll]);
 
   useEffect(() => {
     if (selectedId) loadSelected(selectedId);
   }, [selectedId, loadSelected]);
 
-  // Poll while any item is still parsing or embedding — the server finishes
-  // ingest in the background, so we refresh until everything is ready/failed.
+  // Poll while any PDF item is still parsing
   useEffect(() => {
     if (!selected) return;
-    const hasPending = selected.items.some(
-      (it) => it.embedding_status === 'pending' || it.parse_status === 'pending',
-    );
+    const hasPending = selected.items.some((it) => it.parse_status === 'pending');
     if (!hasPending) return;
     const t = setInterval(() => {
       if (selectedId) loadSelected(selectedId);
@@ -277,140 +249,53 @@ export function KnowledgeBasePage() {
     return () => clearInterval(t);
   }, [selected, selectedId, loadSelected]);
 
-  /* ── KB CRUD ── */
-
-  async function handleSubmitKb() {
-    if (!kbName.trim()) return;
-    const [provider, modelId] = kbEmbedKey.split('::');
+  async function handleSubmit() {
+    if (!name.trim()) return;
     try {
-      if (editingKb) {
-        await knowledgeBaseApi.update(editingKb.id, {
-          name: kbName,
-          description: kbDesc || undefined,
-          embedding_provider: provider,
-          embedding_model: modelId,
-        });
+      if (editing) {
+        await inputDatasetsApi.update(editing.id, { name, description: desc || undefined });
       } else {
-        const created = await knowledgeBaseApi.create({
-          name: kbName,
-          description: kbDesc || undefined,
-          embedding_provider: provider,
-          embedding_model: modelId,
-        });
+        const created = await inputDatasetsApi.create({ name, description: desc || undefined });
         setSelectedId(created.id);
       }
-      setShowKbForm(false);
-      setEditingKb(null);
-      setKbName('');
-      setKbDesc('');
-      setKbEmbedKey(`${DEFAULT_EMBED_PROVIDER}::${DEFAULT_EMBED_MODEL}`);
-      await loadKbs();
+      setShowForm(false);
+      setEditing(null);
+      setName('');
+      setDesc('');
+      await loadAll();
       if (selectedId) await loadSelected(selectedId);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed');
     }
   }
 
-  async function handleReindex() {
-    if (!selected) return;
-    if (!confirm(`Re-index "${selected.name}"? This rebuilds all chunks and embeddings and may take a minute for large KBs.`)) return;
-    setReindexing(true);
-    setError(null);
+  async function handleDelete(ds: InputDataset) {
+    if (!confirm(`Delete "${ds.name}" and all its items?`)) return;
     try {
-      await knowledgeBaseApi.reindex(selected.id);
-      await loadSelected(selected.id);
-      await loadKbs();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Re-index failed');
-    } finally {
-      setReindexing(false);
-    }
-  }
-
-  async function handleUploadDictionary(file: File) {
-    if (!selected) return;
-    setUploading(true);
-    setError(null);
-    try {
-      await knowledgeBaseApi.uploadDictionary(selected.id, file);
-      await loadSelected(selected.id);
-      await loadKbs();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Upload failed');
-    } finally {
-      setUploading(false);
-    }
-  }
-
-  async function handleClearDictionary() {
-    if (!selected) return;
-    if (!confirm('Remove the attached data dictionary?')) return;
-    try {
-      await knowledgeBaseApi.clearDictionary(selected.id);
-      await loadSelected(selected.id);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed');
-    }
-  }
-
-  async function handleCopyToDataset() {
-    if (!selected) return;
-    const name = prompt(`Create a new Dataset from "${selected.name}"?\n\nEnter a name for the Dataset:`, `${selected.name}`);
-    if (!name?.trim()) return;
-    try {
-      const ds = await inputDatasetsApi.copyFromKb(selected.id, { dataset_name: name.trim() });
-      alert(`Dataset "${ds.name}" created with ${ds.items.length} item(s). Find it in the Datasets page.`);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Copy failed');
-    }
-  }
-
-  async function handleDeleteKb(kb: KnowledgeBase) {
-    if (!confirm(`Delete "${kb.name}" and all its items? This cannot be undone.`)) return;
-    try {
-      await knowledgeBaseApi.delete(kb.id);
-      if (selectedId === kb.id) {
+      await inputDatasetsApi.delete(ds.id);
+      if (selectedId === ds.id) {
         setSelected(null);
         setSelectedId(null);
       }
-      await loadKbs();
+      await loadAll();
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed');
     }
   }
 
-  function openEditKb(kb: KnowledgeBase) {
-    setEditingKb(kb);
-    setKbName(kb.name);
-    setKbDesc(kb.description || '');
-    setKbEmbedKey(`${kb.embedding_provider}::${kb.embedding_model}`);
-    setShowKbForm(true);
-  }
-
-  function openCreateKb() {
-    setEditingKb(null);
-    setKbName('');
-    setKbDesc('');
-    setKbEmbedKey(`${DEFAULT_EMBED_PROVIDER}::${DEFAULT_EMBED_MODEL}`);
-    setShowKbForm(true);
-  }
-
-  /* ── Item operations ── */
-
   async function handleAddText() {
-    if (!selected || !itemName.trim() || !itemContent.trim()) return;
+    if (!selected || !itemContent.trim()) return;
     try {
-      await knowledgeBaseApi.createItem(selected.id, {
-        name: itemName,
-        description: itemDesc || undefined,
+      await inputDatasetsApi.createItem(selected.id, {
+        name: itemName.trim() || undefined,
         content: itemContent,
-        source_type: 'text',
+        tags: itemTags.trim() || undefined,
       });
       setItemName('');
-      setItemDesc('');
+      setItemTags('');
       setItemContent('');
       await loadSelected(selected.id);
-      await loadKbs();
+      await loadAll();
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed');
     }
@@ -421,10 +306,14 @@ export function KnowledgeBasePage() {
     setUploading(true);
     setError(null);
     try {
-      await knowledgeBaseApi.uploadPdf(selected.id, file, pdfDesc || undefined);
-      setPdfDesc('');
+      await inputDatasetsApi.uploadPdf(selected.id, file, {
+        name: pdfName.trim() || undefined,
+        tags: pdfTags.trim() || undefined,
+      });
+      setPdfName('');
+      setPdfTags('');
       await loadSelected(selected.id);
-      await loadKbs();
+      await loadAll();
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Upload failed');
     } finally {
@@ -432,14 +321,14 @@ export function KnowledgeBasePage() {
     }
   }
 
-  async function handleUploadBatch(files: FileList | null) {
+  async function handleUploadBatchPdf(files: FileList | null) {
     if (!selected || !files || files.length === 0) return;
     setUploading(true);
     setError(null);
     try {
-      await knowledgeBaseApi.uploadBatchPdf(selected.id, Array.from(files));
+      await inputDatasetsApi.uploadBatchPdf(selected.id, Array.from(files));
       await loadSelected(selected.id);
-      await loadKbs();
+      await loadAll();
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Upload failed');
     } finally {
@@ -452,12 +341,12 @@ export function KnowledgeBasePage() {
     setUploading(true);
     setError(null);
     try {
-      await knowledgeBaseApi.uploadCsv(selected.id, file, {
+      await inputDatasetsApi.uploadCsv(selected.id, file, {
         contentColumn: csvContentColumn.trim() || undefined,
         nameColumn: csvNameColumn.trim() || undefined,
       });
       await loadSelected(selected.id);
-      await loadKbs();
+      await loadAll();
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Upload failed');
     } finally {
@@ -465,134 +354,99 @@ export function KnowledgeBasePage() {
     }
   }
 
-  async function handleDeleteItem(item: KnowledgeBaseItem) {
+  async function handleDeleteItem(item: InputDatasetItem) {
     if (!selected) return;
-    if (!confirm(`Delete item "${item.name}"? This cannot be undone.`)) return;
+    if (!confirm(`Delete item "${item.name || item.content.slice(0, 40)}"?`)) return;
     try {
-      await knowledgeBaseApi.deleteItem(selected.id, item.id);
+      await inputDatasetsApi.deleteItem(selected.id, item.id);
       await loadSelected(selected.id);
-      await loadKbs();
+      await loadAll();
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed');
     }
   }
 
-  /* ── Render ── */
+  function openEdit(ds: InputDataset) {
+    setEditing(ds);
+    setName(ds.name);
+    setDesc(ds.description || '');
+    setShowForm(true);
+  }
+
+  function openCreate() {
+    setEditing(null);
+    setName('');
+    setDesc('');
+    setShowForm(true);
+  }
 
   return (
     <>
-      <TopBar title="Knowledge Base & RAG" />
+      <TopBar title="Datasets" />
       <Page>
-        {/* Left: KB list */}
         <Panel>
           <PanelHeader>
-            <PanelTitle>Knowledge Bases ({kbs.length})</PanelTitle>
-            <Button size="sm" onClick={openCreateKb}>+ New</Button>
+            <PanelTitle>Datasets ({datasets.length})</PanelTitle>
+            <Button size="sm" onClick={openCreate}>+ New</Button>
           </PanelHeader>
           <PanelBody>
             {error && <ErrorText>{error}</ErrorText>}
 
-            {showKbForm && (
+            {showForm && (
               <Card $selected>
                 <CardTitle style={{ marginBottom: 8 }}>
-                  {editingKb ? 'Edit Knowledge Base' : 'New Knowledge Base'}
+                  {editing ? 'Edit Dataset' : 'New Dataset'}
                 </CardTitle>
                 <FormGroup>
                   <Label>Name</Label>
                   <Input
-                    value={kbName}
-                    onChange={(e) => setKbName(e.target.value)}
-                    placeholder="e.g. Medical Policies"
+                    value={name}
+                    onChange={(e) => setName(e.target.value)}
+                    placeholder="e.g. Evaluation cases — classification"
                     autoFocus
                   />
                 </FormGroup>
                 <FormGroup>
                   <Label>Description</Label>
                   <Textarea
-                    value={kbDesc}
-                    onChange={(e) => setKbDesc(e.target.value)}
-                    placeholder="What's in this KB?"
+                    value={desc}
+                    onChange={(e) => setDesc(e.target.value)}
+                    placeholder="What's in this dataset?"
                   />
-                </FormGroup>
-                <FormGroup>
-                  <Label>Embedding Model</Label>
-                  <select
-                    value={kbEmbedKey}
-                    onChange={(e) => setKbEmbedKey(e.target.value)}
-                    style={{
-                      background: tokens.colors.bg.tertiary,
-                      border: `1px solid ${tokens.colors.border.subtle}`,
-                      borderRadius: tokens.radii.sm,
-                      color: tokens.colors.text.primary,
-                      fontFamily: tokens.fonts.body,
-                      fontSize: '0.85rem',
-                      padding: '8px 12px',
-                      outline: 'none',
-                      width: '100%',
-                      boxSizing: 'border-box',
-                    }}
-                  >
-                    {embeddingModels.length === 0 && (
-                      <option value={`${DEFAULT_EMBED_PROVIDER}::${DEFAULT_EMBED_MODEL}`}>
-                        Qwen3-Embedding 0.6B (MLX local)
-                      </option>
-                    )}
-                    {embeddingModels.map((m) => (
-                      <option
-                        key={`${m.provider}::${m.model_id}`}
-                        value={`${m.provider}::${m.model_id}`}
-                      >
-                        {m.display_name}
-                      </option>
-                    ))}
-                  </select>
-                  {editingKb && (
-                    <CardMeta style={{ marginTop: 4 }}>
-                      Changing the model requires a re-index to take effect.
-                    </CardMeta>
-                  )}
                 </FormGroup>
                 <Row>
                   <Button
                     size="sm"
                     variant="ghost"
-                    onClick={() => { setShowKbForm(false); setEditingKb(null); }}
+                    onClick={() => { setShowForm(false); setEditing(null); }}
                   >
                     Cancel
                   </Button>
-                  <Button size="sm" onClick={handleSubmitKb} disabled={!kbName.trim()}>
-                    {editingKb ? 'Save' : 'Create'}
+                  <Button size="sm" onClick={handleSubmit} disabled={!name.trim()}>
+                    {editing ? 'Save' : 'Create'}
                   </Button>
                 </Row>
               </Card>
             )}
 
-            {kbs.length === 0 && !showKbForm && (
-              <EmptyState>No knowledge bases yet.<br />Create one to get started.</EmptyState>
+            {datasets.length === 0 && !showForm && (
+              <EmptyState>No datasets yet.<br />Create one to get started.</EmptyState>
             )}
 
-            {kbs.map((kb) => (
+            {datasets.map((ds) => (
               <Card
-                key={kb.id}
-                $selected={selectedId === kb.id}
-                onClick={() => setSelectedId(kb.id)}
+                key={ds.id}
+                $selected={selectedId === ds.id}
+                onClick={() => setSelectedId(ds.id)}
               >
                 <Row>
                   <div style={{ flex: 1, minWidth: 0 }}>
-                    <CardTitle>{kb.name}</CardTitle>
-                    <CardMeta>
-                      {kb.item_count} items · {kb.chunk_count} chunks
-                    </CardMeta>
-                    <CardMeta style={{ marginTop: 2 }}>
-                      <Badge color="secondary">
-                        {kb.embedding_provider === 'mlx_local' ? 'MLX' : kb.embedding_provider}
-                      </Badge>{' '}
-                      {kb.embedding_model.split('/').pop()}
-                    </CardMeta>
-                    {kb.description && (
+                    <CardTitle>{ds.name}</CardTitle>
+                    <CardMeta>{ds.item_count} items</CardMeta>
+                    {ds.description && (
                       <CardMeta style={{ color: tokens.colors.text.secondary, marginTop: 2 }}>
-                        {kb.description.slice(0, 60)}
-                        {kb.description.length > 60 ? '...' : ''}
+                        {ds.description.slice(0, 60)}
+                        {ds.description.length > 60 ? '...' : ''}
                       </CardMeta>
                     )}
                   </div>
@@ -601,7 +455,7 @@ export function KnowledgeBasePage() {
                   <Button
                     size="sm"
                     variant="ghost"
-                    onClick={(e) => { e.stopPropagation(); openEditKb(kb); }}
+                    onClick={(e) => { e.stopPropagation(); openEdit(ds); }}
                     style={{ fontSize: '0.7rem' }}
                   >
                     Edit
@@ -609,7 +463,7 @@ export function KnowledgeBasePage() {
                   <Button
                     size="sm"
                     variant="danger"
-                    onClick={(e) => { e.stopPropagation(); handleDeleteKb(kb); }}
+                    onClick={(e) => { e.stopPropagation(); handleDelete(ds); }}
                     style={{ fontSize: '0.7rem' }}
                   >
                     Delete
@@ -620,11 +474,10 @@ export function KnowledgeBasePage() {
           </PanelBody>
         </Panel>
 
-        {/* Right: selected KB detail + add items */}
         <Panel>
           {!selected ? (
             <PanelBody>
-              <EmptyState>Select a knowledge base on the left, or create a new one.</EmptyState>
+              <EmptyState>Select a dataset on the left, or create a new one.</EmptyState>
             </PanelBody>
           ) : (
             <>
@@ -632,76 +485,39 @@ export function KnowledgeBasePage() {
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <PanelTitle>{selected.name}</PanelTitle>
                   <CardMeta style={{ marginTop: 2 }}>
-                    {selected.items.length} items · {selected.chunk_count} chunks ·{' '}
-                    <Badge color="secondary">
-                      {selected.embedding_provider === 'mlx_local' ? 'MLX' : selected.embedding_provider}
-                    </Badge>{' '}
-                    {selected.embedding_model.split('/').pop()}
+                    {selected.items.length} items
                     {selected.description && ` · ${selected.description}`}
                   </CardMeta>
-                  {selected.dictionary_filename && (
-                    <CardMeta style={{ marginTop: 2 }}>
-                      <Badge color="primary">Dictionary</Badge>{' '}
-                      {selected.dictionary_filename}{' '}
-                      <span
-                        onClick={handleClearDictionary}
-                        style={{ color: tokens.colors.accent.error, cursor: 'pointer', marginLeft: 6 }}
-                      >
-                        ✕ clear
-                      </span>
-                    </CardMeta>
-                  )}
                 </div>
-                <div style={{ display: 'flex', gap: 6 }}>
-                  <Button size="sm" variant="ghost" onClick={() => loadSelected(selected.id)}>
-                    Refresh
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="secondary"
-                    onClick={handleCopyToDataset}
-                    disabled={selected.items.length === 0}
-                    title="Create a new Dataset with these items as input_text only"
-                  >
-                    Copy to Dataset
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="secondary"
-                    onClick={handleReindex}
-                    disabled={reindexing}
-                  >
-                    {reindexing ? 'Re-indexing...' : 'Re-index'}
-                  </Button>
-                </div>
+                <Button size="sm" variant="ghost" onClick={() => loadSelected(selected.id)}>
+                  Refresh
+                </Button>
               </PanelHeader>
 
               <TabBar>
-                <Tab $active={addTab === 'text'} onClick={() => setAddTab('text')}>+ Text</Tab>
+                <Tab $active={addTab === 'text'} onClick={() => setAddTab('text')}>+ Text Item</Tab>
                 <Tab $active={addTab === 'pdf'} onClick={() => setAddTab('pdf')}>+ PDF</Tab>
                 <Tab $active={addTab === 'batch'} onClick={() => setAddTab('batch')}>+ Batch PDF</Tab>
                 <Tab $active={addTab === 'csv'} onClick={() => setAddTab('csv')}>+ CSV</Tab>
-                <Tab $active={addTab === 'dictionary'} onClick={() => setAddTab('dictionary')}>+ Dictionary</Tab>
               </TabBar>
 
               <PanelBody>
-                {/* ── Add Item Tabs ── */}
                 {addTab === 'text' && (
                   <Card style={{ cursor: 'default' }}>
                     <FormGroup>
-                      <Label>Name</Label>
+                      <Label>Name (optional)</Label>
                       <Input
                         value={itemName}
                         onChange={(e) => setItemName(e.target.value)}
-                        placeholder="Short identifier"
+                        placeholder="Short label"
                       />
                     </FormGroup>
                     <FormGroup>
-                      <Label>Description (optional)</Label>
+                      <Label>Tags (optional, comma-separated)</Label>
                       <Input
-                        value={itemDesc}
-                        onChange={(e) => setItemDesc(e.target.value)}
-                        placeholder="What is this?"
+                        value={itemTags}
+                        onChange={(e) => setItemTags(e.target.value)}
+                        placeholder="e.g. edge-case, happy-path"
                       />
                     </FormGroup>
                     <FormGroup>
@@ -709,7 +525,7 @@ export function KnowledgeBasePage() {
                       <Textarea
                         value={itemContent}
                         onChange={(e) => setItemContent(e.target.value)}
-                        placeholder="Paste or type the item content..."
+                        placeholder="The input text..."
                         style={{ minHeight: 120 }}
                       />
                     </FormGroup>
@@ -718,7 +534,7 @@ export function KnowledgeBasePage() {
                       <Button
                         size="sm"
                         onClick={handleAddText}
-                        disabled={!itemName.trim() || !itemContent.trim()}
+                        disabled={!itemContent.trim()}
                       >
                         Add Item
                       </Button>
@@ -729,15 +545,23 @@ export function KnowledgeBasePage() {
                 {addTab === 'pdf' && (
                   <Card style={{ cursor: 'default' }}>
                     <FormGroup>
-                      <Label>Description (optional)</Label>
+                      <Label>Name (optional — defaults to filename)</Label>
                       <Input
-                        value={pdfDesc}
-                        onChange={(e) => setPdfDesc(e.target.value)}
-                        placeholder="Applied to the uploaded PDF"
+                        value={pdfName}
+                        onChange={(e) => setPdfName(e.target.value)}
+                        placeholder="Short label"
+                      />
+                    </FormGroup>
+                    <FormGroup>
+                      <Label>Tags (optional)</Label>
+                      <Input
+                        value={pdfTags}
+                        onChange={(e) => setPdfTags(e.target.value)}
+                        placeholder="e.g. medical, cms"
                       />
                     </FormGroup>
                     <FileInput
-                      ref={singleFileRef}
+                      ref={pdfRef}
                       type="file"
                       accept=".pdf"
                       onChange={(e) => {
@@ -748,12 +572,13 @@ export function KnowledgeBasePage() {
                     />
                     <Button
                       disabled={uploading}
-                      onClick={() => singleFileRef.current?.click()}
+                      onClick={() => pdfRef.current?.click()}
                     >
                       {uploading ? 'Uploading...' : 'Choose PDF...'}
                     </Button>
                     <CardMeta style={{ marginTop: 6 }}>
-                      The file will be parsed and its text stored as a single item.
+                      The file returns immediately; docling parse runs in the background.
+                      Item shows <code>parse: pending</code> until ready.
                     </CardMeta>
                   </Card>
                 )}
@@ -761,23 +586,23 @@ export function KnowledgeBasePage() {
                 {addTab === 'batch' && (
                   <Card style={{ cursor: 'default' }}>
                     <FileInput
-                      ref={batchFileRef}
+                      ref={batchPdfRef}
                       type="file"
                       accept=".pdf"
                       multiple
                       onChange={(e) => {
-                        handleUploadBatch(e.target.files);
+                        handleUploadBatchPdf(e.target.files);
                         e.target.value = '';
                       }}
                     />
                     <Button
                       disabled={uploading}
-                      onClick={() => batchFileRef.current?.click()}
+                      onClick={() => batchPdfRef.current?.click()}
                     >
                       {uploading ? 'Uploading...' : 'Choose Multiple PDFs...'}
                     </Button>
                     <CardMeta style={{ marginTop: 6 }}>
-                      One item per PDF (filename becomes the name).
+                      One item per PDF (filename becomes the name). Parses run in the background sequentially.
                     </CardMeta>
                   </Card>
                 )}
@@ -789,7 +614,7 @@ export function KnowledgeBasePage() {
                       <Input
                         value={csvContentColumn}
                         onChange={(e) => setCsvContentColumn(e.target.value)}
-                        placeholder="Defaults to 'content' / 'text' / first column"
+                        placeholder="Defaults to content/text/input/prompt or first column"
                       />
                     </FormGroup>
                     <FormGroup>
@@ -797,11 +622,11 @@ export function KnowledgeBasePage() {
                       <Input
                         value={csvNameColumn}
                         onChange={(e) => setCsvNameColumn(e.target.value)}
-                        placeholder="Defaults to 'name' column or row N"
+                        placeholder="Defaults to 'name' column"
                       />
                     </FormGroup>
                     <FileInput
-                      ref={csvFileRef}
+                      ref={csvRef}
                       type="file"
                       accept=".csv"
                       onChange={(e) => {
@@ -812,60 +637,26 @@ export function KnowledgeBasePage() {
                     />
                     <Button
                       disabled={uploading}
-                      onClick={() => csvFileRef.current?.click()}
+                      onClick={() => csvRef.current?.click()}
                     >
                       {uploading ? 'Uploading...' : 'Choose CSV...'}
                     </Button>
                     <CardMeta style={{ marginTop: 6 }}>
-                      Each non-empty row becomes one item. All columns other than the content /
-                      name / description columns are captured as per-row metadata and shown to the
-                      model alongside retrieved chunks.
+                      Non-content columns become per-row metadata.
                     </CardMeta>
                   </Card>
                 )}
 
-                {addTab === 'dictionary' && (
-                  <Card style={{ cursor: 'default' }}>
-                    <FileInput
-                      ref={dictFileRef}
-                      type="file"
-                      accept=".csv,.md,.txt"
-                      onChange={(e) => {
-                        const f = e.target.files?.[0];
-                        if (f) handleUploadDictionary(f);
-                        e.target.value = '';
-                      }}
-                    />
-                    <Button
-                      disabled={uploading}
-                      onClick={() => dictFileRef.current?.click()}
-                    >
-                      {uploading ? 'Uploading...' : 'Choose Dictionary file...'}
-                    </Button>
-                    <CardMeta style={{ marginTop: 6 }}>
-                      Attach a data dictionary (CSV with <code>column,description</code> or plain
-                      markdown/text) that explains what each field means. It is prepended to every
-                      RAG query so the model can interpret column names and metadata.
-                    </CardMeta>
-                    {selected.dictionary_content && (
-                      <div style={{ marginTop: 10 }}>
-                        <Label>Current dictionary</Label>
-                        <DetailBox>{selected.dictionary_content}</DetailBox>
-                      </div>
-                    )}
-                  </Card>
-                )}
-
-                {/* ── Item list ── */}
                 <div style={{ marginTop: tokens.spacing.lg }}>
                   <PanelTitle style={{ fontSize: '0.72rem', marginBottom: 10 }}>
                     Items
                   </PanelTitle>
                   {selected.items.length === 0 && (
-                    <EmptyState>No items yet. Add one above.</EmptyState>
+                    <EmptyState>No items yet.</EmptyState>
                   )}
                   {selected.items.map((item) => {
                     const isOpen = expandedItemId === item.id;
+                    const label = item.name || item.content.slice(0, 60);
                     return (
                       <Card
                         key={item.id}
@@ -878,7 +669,8 @@ export function KnowledgeBasePage() {
                               <span style={{ marginRight: 6, opacity: 0.5, fontSize: '0.7rem' }}>
                                 {isOpen ? '▼' : '▶'}
                               </span>
-                              {item.name}
+                              {label}
+                              {label.length >= 60 && '…'}
                             </CardTitle>
                             <CardMeta>
                               <Badge
@@ -904,43 +696,20 @@ export function KnowledgeBasePage() {
                                   </Badge>
                                 </>
                               )}
-                              {' '}
-                              <Badge
-                                color={
-                                  item.embedding_status === 'ready' ? 'success'
-                                  : item.embedding_status === 'failed' ? 'error'
-                                  : 'warning'
-                                }
-                              >
-                                embed: {item.embedding_status}
-                              </Badge>
+                              {item.tags && <> {' '}<Badge color="secondary">{item.tags}</Badge></>}
                               {' · '}{item.content.length.toLocaleString()} chars
                               {item.file_size_bytes && (
                                 <> · {(item.file_size_bytes / 1024).toFixed(1)} KB</>
                               )}
+                              {item.source_filename && ` · ${item.source_filename}`}
                             </CardMeta>
-                            {item.description && !isOpen && (
-                              <CardMeta style={{ color: tokens.colors.text.secondary, marginTop: 2 }}>
-                                {item.description.slice(0, 60)}
-                                {item.description.length > 60 ? '...' : ''}
-                              </CardMeta>
-                            )}
                           </div>
                         </Row>
-
                         {isOpen && (
                           <div
                             onClick={(e) => e.stopPropagation()}
                             style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 8 }}
                           >
-                            {item.description && (
-                              <div>
-                                <Label>Description</Label>
-                                <CardMeta style={{ color: tokens.colors.text.primary, fontFamily: tokens.fonts.body, fontSize: '0.82rem' }}>
-                                  {item.description}
-                                </CardMeta>
-                              </div>
-                            )}
                             {item.metadata_json && (
                               <div>
                                 <Label>Metadata</Label>
@@ -955,17 +724,13 @@ export function KnowledgeBasePage() {
                                 </DetailBox>
                               </div>
                             )}
-                            {item.embedding_error && (
-                              <div>
-                                <Label>Embedding Error</Label>
-                                <DetailBox style={{ color: tokens.colors.accent.error }}>
-                                  {item.embedding_error}
-                                </DetailBox>
-                              </div>
-                            )}
                             <div>
                               <Label>Content</Label>
-                              <DetailBox>{item.content}</DetailBox>
+                              <DetailBox>
+                                {item.parse_status === 'pending' && !item.content
+                                  ? '(parsing…)'
+                                  : item.content}
+                              </DetailBox>
                             </div>
                             <Row>
                               <CardMeta>

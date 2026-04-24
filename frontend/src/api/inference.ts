@@ -6,6 +6,9 @@ interface InferenceRequest {
   model_config_id: string;
   document_id?: string;
   input_text?: string;
+  kb_id?: string | null;
+  kb_top_k?: number;
+  rag_override_none?: boolean;
 }
 
 export const inferenceApi = {

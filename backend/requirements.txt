@@ -16,3 +16,5 @@ docling>=2.0.0
 pytesseract>=0.3.10
 pdf2image>=1.17.0
 Pillow>=10.0.0
+numpy>=1.26.0
+mlx-embeddings>=0.0.3

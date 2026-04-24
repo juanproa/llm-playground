@@ -70,6 +70,20 @@ async def create_version(db: AsyncSession, prompt_id: str, data: PromptVersionCr
     )
     max_version = result.scalar() or 0
 
+    # Carry over the prior active version's RAG binding so that iterating on
+    # wording doesn't silently lose the attached KB.
+    inherited_kb: str | None = None
+    inherited_top_k: int = 5
+    if data.kb_id is None and data.kb_top_k is None:
+        prev = await db.execute(
+            select(PromptVersion)
+            .where(PromptVersion.prompt_id == prompt_id, PromptVersion.is_active == True)
+        )
+        active = prev.scalar_one_or_none()
+        if active is not None:
+            inherited_kb = active.kb_id
+            inherited_top_k = active.kb_top_k or 5
+
     version = PromptVersion(
         prompt_id=prompt_id,
         version_number=max_version + 1,
@@ -77,6 +91,8 @@ async def create_version(db: AsyncSession, prompt_id: str, data: PromptVersionCr
         content=data.content,
         system_message=data.system_message,
         is_active=False,
+        kb_id=data.kb_id if data.kb_id is not None else inherited_kb,
+        kb_top_k=data.kb_top_k if data.kb_top_k is not None else inherited_top_k,
     )
     db.add(version)
     await db.flush()
@@ -110,7 +126,11 @@ async def update_version(db: AsyncSession, version_id: str, data: PromptVersionU
         for v in result.scalars().all():
             v.is_active = False
 
-    for key, value in data.model_dump(exclude_unset=True).items():
+    payload = data.model_dump(exclude_unset=True)
+    # `clear_kb` is a sentinel — translate it to kb_id=None and drop the flag.
+    if payload.pop("clear_kb", False):
+        version.kb_id = None
+    for key, value in payload.items():
         setattr(version, key, value)
     await db.flush()
     return version

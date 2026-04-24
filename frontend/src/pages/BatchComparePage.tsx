@@ -24,6 +24,7 @@ import type {
   BacktestRun,
   ComparisonRun,
   ComparisonRunWithChildren,
+  Dataset,
   KnowledgeBase,
   KnowledgeBaseItem,
   TestCase,
@@ -199,6 +200,42 @@ const CheckRow = styled.label`
   &:hover { background: ${tokens.colors.bg.tertiary}; }
 `;
 
+/* ─── Add-to-Dataset dialog ──────────────────────────────────────────────── */
+
+const DialogOverlay = styled.div`
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.65);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 200;
+`;
+
+const Dialog = styled.div`
+  background: ${tokens.colors.bg.secondary};
+  border: 1px solid ${tokens.colors.border.subtle};
+  border-radius: ${tokens.radii.md};
+  width: 540px;
+  max-height: 90vh;
+  overflow-y: auto;
+`;
+
+const PreviewBox = styled.pre`
+  background: ${tokens.colors.bg.primary};
+  border: 1px solid ${tokens.colors.border.subtle};
+  border-radius: ${tokens.radii.sm};
+  padding: 8px 10px;
+  font-family: ${tokens.fonts.mono};
+  font-size: 0.72rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 100px;
+  overflow-y: auto;
+  color: ${tokens.colors.text.primary};
+  margin: 0;
+`;
+
 /* ─── Matrix ─────────────────────────────────────────────────────────────── */
 
 const Matrix = styled.table`
@@ -288,6 +325,14 @@ export function BatchComparePage() {
   const [showOnlyDisagree, setShowOnlyDisagree] = useState(false);
   const [showOnlyFailures, setShowOnlyFailures] = useState(false);
   const [activeAssertion, setActiveAssertion] = useState<string>('');
+
+  // Add-to-dataset state
+  const [addTarget, setAddTarget] = useState<AddToDatasetTarget | null>(null);
+  const [datasets, setDatasets] = useState<Dataset[]>([]);
+  const [selectedDatasetId, setSelectedDatasetId] = useState<string>('');
+  const [newDatasetName, setNewDatasetName] = useState<string>('');
+  const [savingToDataset, setSavingToDataset] = useState(false);
+  const [saveSuccess, setSaveSuccess] = useState(false);
 
   // New-comparison form
   const [name, setName] = useState('');
@@ -407,6 +452,46 @@ export function BatchComparePage() {
     } catch (e) {
       alert((e as Error).message);
     }
+  }
+
+  async function openAddToDataset(target: AddToDatasetTarget) {
+    setAddTarget(target);
+    setSaveSuccess(false);
+    setSelectedDatasetId('');
+    setNewDatasetName('');
+    if (!projectId) return;
+    try {
+      const list = await postTrainingApi.listDatasets(projectId);
+      setDatasets(list);
+    } catch {
+      setDatasets([]);
+    }
+  }
+
+  async function handleSaveToDataset() {
+    if (!projectId || !addTarget) return;
+    setSavingToDataset(true);
+    try {
+      let datasetId = selectedDatasetId;
+      if (!datasetId) {
+        const created = await postTrainingApi.createDataset(projectId, {
+          name: newDatasetName.trim() || `From Batch Compare — ${new Date().toLocaleDateString()}`,
+        });
+        datasetId = created.id;
+        setDatasets((prev) => [created, ...prev]);
+        setSelectedDatasetId(created.id);
+      }
+      await postTrainingApi.addDatasetItems(projectId, datasetId, [{
+        input_text: addTarget.testCase.input_text,
+        output_text: addTarget.cell.result.actual_output ?? '',
+        instruction: addTarget.testCase.name,
+        tags: `batch_compare,model:${addTarget.modelName}`,
+      }]);
+      setSaveSuccess(true);
+    } catch (e) {
+      alert((e as Error).message);
+    }
+    setSavingToDataset(false);
   }
 
   // Build the matrix data from detail
@@ -628,6 +713,7 @@ export function BatchComparePage() {
                           displayPass = ar?.passed ?? false;
                         }
 
+                        const modelName = models.find((x) => x.id === matrix.modelIds[colIdx])?.name ?? matrix.modelIds[colIdx].slice(0, 8);
                         return (
                           <Td
                             key={colIdx}
@@ -646,9 +732,23 @@ export function BatchComparePage() {
                                   {Math.round(displayScore * 100)}%
                                 </Badge>
                               )}
-                              <div style={{ display: 'flex', gap: 4, fontSize: '0.7rem', color: tokens.colors.text.muted }}>
+                              <div style={{ display: 'flex', gap: 4, fontSize: '0.7rem', color: tokens.colors.text.muted, alignItems: 'center' }}>
                                 {cell.result.cache_hit && <span title="From cache">⚡</span>}
                                 {cell.result.latency_ms != null && <span>{cell.result.latency_ms}ms</span>}
+                                {cell.result.actual_output && (
+                                  <Button
+                                    size="sm"
+                                    variant="ghost"
+                                    title="Add this output to a Fine-Tuning dataset"
+                                    style={{ padding: '1px 6px', fontSize: '0.65rem', opacity: 0.7 }}
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      openAddToDataset({ testCase: row.testCase, cell, modelName });
+                                    }}
+                                  >
+                                    + Dataset
+                                  </Button>
+                                )}
                               </div>
                             </Row>
                             {!noJudgment && <ScoreBar $score={displayScore} style={{ marginTop: 4 }} />}
@@ -736,6 +836,70 @@ export function BatchComparePage() {
           )}
         </RightPane>
       </Page>
+
+      {/* ── Add to Fine-Tuning Dataset dialog ── */}
+      {addTarget && (
+        <DialogOverlay onClick={() => setAddTarget(null)}>
+          <Dialog onClick={(e) => e.stopPropagation()}>
+            <ModalHead>
+              <PaneTitle>Add to Fine-Tuning Dataset</PaneTitle>
+              <Button size="sm" variant="ghost" onClick={() => setAddTarget(null)}>Close</Button>
+            </ModalHead>
+            <ModalBody>
+              {saveSuccess ? (
+                <div style={{ textAlign: 'center', padding: '16px 0', color: tokens.colors.accent.success }}>
+                  Saved successfully!{' '}
+                  <Button size="sm" variant="ghost" onClick={() => setAddTarget(null)}>Close</Button>
+                </div>
+              ) : (
+                <>
+                  <FormGroup>
+                    <Label>Input (test case)</Label>
+                    <PreviewBox>{addTarget.testCase.input_text}</PreviewBox>
+                  </FormGroup>
+                  <FormGroup>
+                    <Label>Output ({addTarget.modelName})</Label>
+                    <PreviewBox>{addTarget.cell.result.actual_output ?? '(no output)'}</PreviewBox>
+                  </FormGroup>
+
+                  <FormGroup>
+                    <Label>Target Dataset</Label>
+                    <Select
+                      value={selectedDatasetId}
+                      onChange={(e) => { setSelectedDatasetId(e.target.value); setNewDatasetName(''); }}
+                    >
+                      <option value="">— Create new dataset —</option>
+                      {datasets.map((d) => (
+                        <option key={d.id} value={d.id}>
+                          {d.name} ({d.item_count} items)
+                        </option>
+                      ))}
+                    </Select>
+                  </FormGroup>
+
+                  {!selectedDatasetId && (
+                    <FormGroup>
+                      <Label>New Dataset Name</Label>
+                      <Input
+                        value={newDatasetName}
+                        onChange={(e) => setNewDatasetName(e.target.value)}
+                        placeholder={`From Batch Compare — ${new Date().toLocaleDateString()}`}
+                      />
+                    </FormGroup>
+                  )}
+
+                  <Button
+                    disabled={savingToDataset}
+                    onClick={handleSaveToDataset}
+                  >
+                    {savingToDataset ? 'Saving…' : 'Save to Dataset'}
+                  </Button>
+                </>
+              )}
+            </ModalBody>
+          </Dialog>
+        </DialogOverlay>
+      )}
 
       {showModal && (
         <ModalOverlay onClick={() => setShowModal(false)}>
@@ -889,6 +1053,12 @@ export function BatchComparePage() {
 }
 
 /* ─── Matrix building ────────────────────────────────────────────────────── */
+
+interface AddToDatasetTarget {
+  testCase: TestCase;
+  cell: CellData;
+  modelName: string;
+}
 
 interface CellData {
   run: BacktestRun;

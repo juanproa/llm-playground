@@ -4,7 +4,7 @@ import { WorkspaceSubNav } from '../components/workspace/WorkspaceSubNav';
 import styled from 'styled-components';
 import { tokens } from '../theme/tokens';
 import { TopBar } from '../components/layout/TopBar';
-import { InputPanel } from '../components/workspace/InputPanel';
+import { InputPanel, type RagOverride } from '../components/workspace/InputPanel';
 import { PromptEditor } from '../components/workspace/PromptEditor';
 import { ModelSelector } from '../components/workspace/ModelSelector';
 import { ResultsPanel } from '../components/workspace/ResultsPanel';
@@ -74,6 +74,15 @@ export function ProjectWorkspacePage() {
   const [isDocUploading, setIsDocUploading] = useState(false);
   const [showComparison, setShowComparison] = useState(false);
   const [comparisonModels, setComparisonModels] = useState<[ModelConfig | null, ModelConfig | null]>([null, null]);
+  const [ragOverride, setRagOverride] = useState<RagOverride>({ mode: 'prompt' });
+
+  // Translate the per-call RAG override into the fields the inference API
+  // expects (request-level override → else fall back to prompt-version binding).
+  const ragFields = (): { kb_id?: string | null; kb_top_k?: number; rag_override_none?: boolean } => {
+    if (ragOverride.mode === 'off') return { rag_override_none: true };
+    if (ragOverride.mode === 'custom') return { kb_id: ragOverride.kbId || null, kb_top_k: ragOverride.topK };
+    return {}; // "prompt" → send nothing, backend reads prompt_version defaults
+  };
 
   useEffect(() => {
     if (projectId) {
@@ -94,6 +103,7 @@ export function ProjectWorkspacePage() {
       model_config_id: selectedModel.id,
       document_id: selectedDocument?.id,
       input_text: inputText,
+      ...ragFields(),
     });
   };
 
@@ -108,6 +118,7 @@ export function ProjectWorkspacePage() {
       input_text: inputText,
       modelA_id: modelA.id,
       modelB_id: modelB.id,
+      ...ragFields(),
     });
   };
 
@@ -128,6 +139,8 @@ export function ProjectWorkspacePage() {
             selectedDocument={selectedDocument}
             onDocumentSelect={setSelectedDocument}
             onUploadingChange={setIsDocUploading}
+            selectedVersion={selectedVersion}
+            onRagOverrideChange={setRagOverride}
           />
           <PromptEditor
             projectId={currentProject.id}

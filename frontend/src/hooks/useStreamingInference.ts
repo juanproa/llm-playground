@@ -8,6 +8,9 @@ interface StreamParams {
   model_config_id: string;
   document_id?: string;
   input_text?: string;
+  kb_id?: string | null;
+  kb_top_k?: number;
+  rag_override_none?: boolean;
 }
 
 function parseSSELines(buffer: string, handler: (data: Record<string, unknown>) => void): string {
@@ -71,6 +74,9 @@ export function useStreamingInference() {
           model_config_id: params.model_config_id,
           document_id: params.document_id,
           input_text: params.input_text || '',
+          ...(params.kb_id !== undefined ? { kb_id: params.kb_id } : {}),
+          ...(params.kb_top_k !== undefined ? { kb_top_k: params.kb_top_k } : {}),
+          ...(params.rag_override_none ? { rag_override_none: true } : {}),
         }),
         signal: controller.signal,
       });

@@ -10,10 +10,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import async_session
 from app.models.document import Document
 from app.models.inference import InferenceRun
+from app.models.knowledge_base import KnowledgeBase
 from app.models.model_config import ModelConfig
 from app.models.prompt import PromptVersion
 from app.providers.registry import get_provider
 from app.schemas.inference import InferenceRequest
+from app.services import rag_service
 from app.services.model_config_service import decrypt_api_key
 
 logger = logging.getLogger(__name__)
@@ -193,11 +195,19 @@ def _resolve_max_tokens(value: int) -> int:
 
 
 def _build_messages(
-    prompt_version: PromptVersion, input_text: str, document: Document | None
+    prompt_version: PromptVersion,
+    input_text: str,
+    document: Document | None,
+    rag_context: str = "",
 ) -> list[dict]:
     messages = []
+    system_parts: list[str] = []
     if prompt_version.system_message:
-        messages.append({"role": "system", "content": prompt_version.system_message})
+        system_parts.append(prompt_version.system_message)
+    if rag_context:
+        system_parts.append(rag_context)
+    if system_parts:
+        messages.append({"role": "system", "content": "\n\n".join(system_parts)})
 
     user_content = prompt_version.content
     if document and document.raw_text:
@@ -209,6 +219,54 @@ def _build_messages(
     return messages
 
 
+async def _resolve_rag_binding(
+    request: InferenceRequest, prompt_version: PromptVersion
+) -> tuple[str | None, int]:
+    """Resolve which KB and top-k to use for this call.
+
+    Precedence:
+      1. request.rag_override_none=True → RAG disabled
+      2. request.kb_id set → use that (+ request.kb_top_k or prompt default)
+      3. prompt version's kb_id → use that (+ prompt's kb_top_k)
+      4. Nothing → RAG disabled
+    """
+    if request.rag_override_none:
+        return None, 0
+    kb_id = request.kb_id or prompt_version.kb_id
+    top_k = request.kb_top_k or prompt_version.kb_top_k or 5
+    return kb_id, top_k
+
+
+async def _build_rag_context(
+    db: AsyncSession, request: InferenceRequest, prompt_version: PromptVersion
+) -> str:
+    """Resolve retrieval for the request's attached KB (if any).
+
+    Uses `input_text` as the retrieval query. Returns an empty string when no
+    KB is attached or when retrieval yields nothing. Errors are swallowed with
+    a warning so RAG failure doesn't kill the inference run.
+    """
+    kb_id, top_k = await _resolve_rag_binding(request, prompt_version)
+    if not kb_id:
+        return ""
+    kb = await db.get(KnowledgeBase, kb_id)
+    if not kb:
+        logger.warning("Inference requested KB %s which was not found — skipping RAG", kb_id)
+        return ""
+    query = (request.input_text or "").strip()
+    if not query:
+        # Without a user query we only have the dictionary to share (if any)
+        if kb.dictionary_content:
+            return rag_service.format_chunks_for_prompt([], kb.dictionary_content)
+        return ""
+    try:
+        hits = await rag_service.query_kb(db, kb, query, top_k=top_k)
+    except Exception as e:
+        logger.warning("KB retrieval failed for kb_id=%s: %s", kb_id, e)
+        return ""
+    return rag_service.format_chunks_for_prompt(hits, kb.dictionary_content)
+
+
 async def run_inference(db: AsyncSession, project_id: str, request: InferenceRequest) -> InferenceRun:
     prompt_version = await db.get(PromptVersion, request.prompt_version_id)
     model_config = await db.get(ModelConfig, request.model_config_id)
@@ -217,7 +275,8 @@ async def run_inference(db: AsyncSession, project_id: str, request: InferenceReq
     if not prompt_version or not model_config:
         raise ValueError("Invalid prompt version or model config")
 
-    messages = _build_messages(prompt_version, request.input_text, document)
+    rag_context = await _build_rag_context(db, request, prompt_version)
+    messages = _build_messages(prompt_version, request.input_text, document, rag_context)
 
     run = InferenceRun(
         project_id=project_id,
@@ -287,7 +346,8 @@ async def create_stream_run(
     if not prompt_version or not model_config:
         raise ValueError("Invalid prompt version or model config")
 
-    messages = _build_messages(prompt_version, request.input_text, document)
+    rag_context = await _build_rag_context(db, request, prompt_version)
+    messages = _build_messages(prompt_version, request.input_text, document, rag_context)
 
     # Create run in its own committed session so it's visible to save later
     async with async_session() as create_db:

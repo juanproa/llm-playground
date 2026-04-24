@@ -9,9 +9,21 @@ export const promptsApi = {
   update: (id: string, data: { name?: string }) =>
     apiFetch<Prompt>(`/prompts/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   delete: (id: string) => apiFetch<void>(`/prompts/${id}`, { method: 'DELETE' }),
-  createVersion: (promptId: string, data: { content: string; system_message?: string; label?: string }) =>
+  createVersion: (
+    promptId: string,
+    data: { content: string; system_message?: string; label?: string; kb_id?: string | null; kb_top_k?: number },
+  ) =>
     apiFetch<PromptVersion>(`/prompts/${promptId}/versions`, { method: 'POST', body: JSON.stringify(data) }),
   listVersions: (promptId: string) => apiFetch<PromptVersion[]>(`/prompts/${promptId}/versions`),
-  updateVersion: (versionId: string, data: { label?: string; is_active?: boolean }) =>
+  updateVersion: (
+    versionId: string,
+    data: {
+      label?: string;
+      is_active?: boolean;
+      kb_id?: string | null;
+      kb_top_k?: number;
+      clear_kb?: boolean;
+    },
+  ) =>
     apiFetch<PromptVersion>(`/prompt-versions/${versionId}`, { method: 'PUT', body: JSON.stringify(data) }),
 };

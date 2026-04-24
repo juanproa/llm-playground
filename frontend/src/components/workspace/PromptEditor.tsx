@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import styled from 'styled-components';
 import { tokens } from '../../theme/tokens';
 import { Card, CardTitle, CardHeader } from '../common/Card';
@@ -7,8 +7,10 @@ import { Input, TextArea, Label, FormGroup } from '../common/Input';
 import { Select } from '../common/Select';
 import { Badge } from '../common/Badge';
 import { Modal } from '../common/Modal';
-import type { Prompt, PromptVersion } from '../../types';
+import type { KnowledgeBase, Prompt, PromptVersion } from '../../types';
 import { usePromptStore } from '../../stores/promptStore';
+import { knowledgeBaseApi } from '../../api/knowledgeBase';
+import { promptsApi } from '../../api/prompts';
 
 const VersionSelector = styled.div`
   display: flex;
@@ -37,6 +39,44 @@ export function PromptEditor({ projectId, prompts, selectedPrompt, selectedVersi
   const [editedSystem, setEditedSystem] = useState('');
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
+
+  // RAG binding on the current prompt version
+  const [kbs, setKbs] = useState<KnowledgeBase[]>([]);
+  const [kbSaving, setKbSaving] = useState(false);
+
+  useEffect(() => {
+    knowledgeBaseApi.list().then(setKbs).catch(() => setKbs([]));
+  }, []);
+
+  const handleKbChange = async (kbId: string) => {
+    if (!selectedVersion) return;
+    setKbSaving(true);
+    try {
+      const updated = kbId
+        ? await promptsApi.updateVersion(selectedVersion.id, { kb_id: kbId })
+        : await promptsApi.updateVersion(selectedVersion.id, { clear_kb: true });
+      onSelectVersion(updated);
+      await fetchPrompts(projectId);
+    } finally {
+      setKbSaving(false);
+    }
+  };
+
+  const handleTopKChange = async (topK: number) => {
+    if (!selectedVersion) return;
+    setKbSaving(true);
+    try {
+      const updated = await promptsApi.updateVersion(selectedVersion.id, { kb_top_k: topK });
+      onSelectVersion(updated);
+      await fetchPrompts(projectId);
+    } finally {
+      setKbSaving(false);
+    }
+  };
+
+  const attachedKb = selectedVersion?.kb_id
+    ? kbs.find((k) => k.id === selectedVersion.kb_id) || null
+    : null;
 
   const syncEditorToVersion = (version: PromptVersion | null) => {
     setEditedContent(version?.content || '');
@@ -91,7 +131,7 @@ export function PromptEditor({ projectId, prompts, selectedPrompt, selectedVersi
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Prompt</CardTitle>
+        <CardTitle>Prompt &amp; RAG</CardTitle>
         <Button size="sm" variant="secondary" onClick={() => setShowCreate(true)}>New Prompt</Button>
       </CardHeader>
 
@@ -187,6 +227,78 @@ export function PromptEditor({ projectId, prompts, selectedPrompt, selectedVersi
                   </Button>
                 </div>
               )}
+
+              <FormGroup style={{ marginTop: tokens.spacing.md, paddingTop: tokens.spacing.md, borderTop: `1px solid ${tokens.colors.border.subtle}` }}>
+                <Label>RAG Knowledge Base (optional)</Label>
+                <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                  <Select
+                    value={selectedVersion.kb_id || ''}
+                    onChange={(e) => handleKbChange(e.target.value)}
+                    disabled={kbSaving}
+                    style={{ flex: 1 }}
+                  >
+                    <option value="">— no KB —</option>
+                    {kbs.map((kb) => (
+                      <option key={kb.id} value={kb.id}>
+                        {kb.name} ({kb.chunk_count} chunks)
+                      </option>
+                    ))}
+                  </Select>
+                  {selectedVersion.kb_id && (
+                    <div style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 6,
+                      padding: '4px 8px',
+                      background: tokens.colors.bg.tertiary,
+                      border: `1px solid ${tokens.colors.border.subtle}`,
+                      borderRadius: tokens.radii.sm,
+                      fontSize: '0.75rem',
+                      color: tokens.colors.text.secondary,
+                    }}>
+                      <span>top-k</span>
+                      <input
+                        type="number"
+                        min={1}
+                        max={20}
+                        value={selectedVersion.kb_top_k}
+                        onChange={(e) => handleTopKChange(Math.max(1, Math.min(20, Number(e.target.value) || 1)))}
+                        disabled={kbSaving}
+                        style={{
+                          width: 48,
+                          background: tokens.colors.bg.primary,
+                          border: `1px solid ${tokens.colors.border.subtle}`,
+                          borderRadius: tokens.radii.sm,
+                          color: tokens.colors.text.primary,
+                          fontFamily: tokens.fonts.mono,
+                          fontSize: '0.8rem',
+                          padding: '4px 6px',
+                          outline: 'none',
+                          textAlign: 'center',
+                        }}
+                      />
+                    </div>
+                  )}
+                </div>
+                {attachedKb ? (
+                  <div style={{
+                    marginTop: 6,
+                    fontSize: '0.72rem',
+                    color: tokens.colors.text.muted,
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 6,
+                    flexWrap: 'wrap',
+                  }}>
+                    <Badge color="primary">RAG ON</Badge>
+                    <span>Top {selectedVersion.kb_top_k} chunks from "{attachedKb.name}" will be prepended to the system prompt.</span>
+                  </div>
+                ) : (
+                  <div style={{ fontSize: '0.72rem', color: tokens.colors.text.muted, marginTop: 4 }}>
+                    Bind a KB to this prompt version so every run auto-retrieves context. You can still override per-call from the Input panel.
+                  </div>
+                )}
+              </FormGroup>
             </>
           )}
         </>

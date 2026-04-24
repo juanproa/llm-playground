@@ -7,7 +7,14 @@ import { TextArea, Label, FormGroup } from '../common/Input';
 import { Badge } from '../common/Badge';
 import { documentsApi } from '../../api/documents';
 import { knowledgeBaseApi } from '../../api/knowledgeBase';
-import type { Document, KnowledgeBase, KnowledgeBaseItem } from '../../types';
+import { inputDatasetsApi } from '../../api/inputDatasets';
+import type {
+  Document,
+  InputDataset,
+  InputDatasetItem,
+  KnowledgeBase,
+  PromptVersion,
+} from '../../types';
 
 const UploadZone = styled.div<{ $dragOver?: boolean }>`
   border: 2px dashed ${({ $dragOver }) => $dragOver ? tokens.colors.accent.primary : tokens.colors.border.subtle};
@@ -211,6 +218,11 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+export type RagOverride =
+  | { mode: 'prompt' }           // use whatever is bound to the prompt version
+  | { mode: 'off' }              // explicitly disable RAG for this call
+  | { mode: 'custom'; kbId: string; topK: number };
+
 interface Props {
   projectId: string;
   inputText: string;
@@ -218,43 +230,74 @@ interface Props {
   selectedDocument: Document | null;
   onDocumentSelect: (doc: Document | null) => void;
   onUploadingChange?: (uploading: boolean) => void;
+  selectedVersion: PromptVersion | null;
+  // Per-call RAG override. The prompt version supplies the default binding;
+  // this lets the user disable or swap the KB for a single run.
+  onRagOverrideChange?: (override: RagOverride) => void;
 }
 
-export function InputPanel({ projectId, inputText, onInputTextChange, selectedDocument, onDocumentSelect, onUploadingChange }: Props) {
+export function InputPanel({
+  projectId,
+  inputText,
+  onInputTextChange,
+  selectedDocument,
+  onDocumentSelect,
+  onUploadingChange,
+  selectedVersion,
+  onRagOverrideChange,
+}: Props) {
   const fileRef = useRef<HTMLInputElement>(null);
   const [uploading, setUploading] = useState(false);
   const [uploadFileName, setUploadFileName] = useState('');
   const [dragOver, setDragOver] = useState(false);
 
-  // Knowledge-base integration
   const [kbs, setKbs] = useState<KnowledgeBase[]>([]);
-  const [kbItems, setKbItems] = useState<KnowledgeBaseItem[]>([]);
-  const [selectedKbId, setSelectedKbId] = useState<string>('');
-  const [loadingKbItems, setLoadingKbItems] = useState(false);
+
+  // Dataset browsing
+  const [datasets, setDatasets] = useState<InputDataset[]>([]);
+  const [selectedDatasetId, setSelectedDatasetId] = useState<string>('');
+  const [datasetItems, setDatasetItems] = useState<InputDatasetItem[]>([]);
+  const [loadingItems, setLoadingItems] = useState(false);
+
+  // Per-call RAG override
+  const [ragMode, setRagMode] = useState<'prompt' | 'off' | 'custom'>('prompt');
+  const [customKbId, setCustomKbId] = useState<string>('');
+  const [customTopK, setCustomTopK] = useState<number>(5);
 
   useEffect(() => {
     knowledgeBaseApi.list().then(setKbs).catch(() => setKbs([]));
+    inputDatasetsApi.list().then(setDatasets).catch(() => setDatasets([]));
   }, []);
 
   useEffect(() => {
-    if (!selectedKbId) { setKbItems([]); return; }
-    setLoadingKbItems(true);
-    knowledgeBaseApi.listItems(selectedKbId)
-      .then(setKbItems)
-      .catch(() => setKbItems([]))
-      .finally(() => setLoadingKbItems(false));
-    // Switching KBs clears any previously highlighted item
-    setSelectedKbItemId('');
-  }, [selectedKbId]);
+    if (!selectedDatasetId) { setDatasetItems([]); return; }
+    setLoadingItems(true);
+    inputDatasetsApi.listItems(selectedDatasetId)
+      .then(setDatasetItems)
+      .catch(() => setDatasetItems([]))
+      .finally(() => setLoadingItems(false));
+  }, [selectedDatasetId]);
 
-  const [selectedKbItemId, setSelectedKbItemId] = useState<string>('');
+  // Switching prompt versions: reset override back to "follow the prompt"
+  useEffect(() => {
+    setRagMode('prompt');
+  }, [selectedVersion?.id]);
 
-  const insertKbItem = (item: KnowledgeBaseItem) => {
-    // Replace the input with the selected item (erases any previous item/typed content)
-    const header = `--- ${item.name} ---\n`;
+  useEffect(() => {
+    if (!onRagOverrideChange) return;
+    if (ragMode === 'prompt') onRagOverrideChange({ mode: 'prompt' });
+    else if (ragMode === 'off') onRagOverrideChange({ mode: 'off' });
+    else onRagOverrideChange({ mode: 'custom', kbId: customKbId, topK: customTopK });
+  }, [ragMode, customKbId, customTopK, onRagOverrideChange]);
+
+  const pickDatasetItem = (item: InputDatasetItem) => {
+    const header = item.name ? `--- ${item.name} ---\n` : '';
     onInputTextChange(header + item.content);
-    setSelectedKbItemId(item.id);
   };
+
+  const promptKb = selectedVersion?.kb_id
+    ? kbs.find((k) => k.id === selectedVersion.kb_id) || null
+    : null;
 
   const handleUpload = async (file: File) => {
     setUploading(true);
@@ -380,57 +423,59 @@ export function InputPanel({ projectId, inputText, onInputTextChange, selectedDo
         )}
       </FormGroup>
 
-      {kbs.length > 0 && (
+      {datasets.length > 0 && (
         <FormGroup>
-          <Label>Knowledge Base (optional)</Label>
-          <select
-            value={selectedKbId}
-            onChange={(e) => setSelectedKbId(e.target.value)}
-            style={{
-              background: tokens.colors.bg.tertiary,
-              border: `1px solid ${tokens.colors.border.subtle}`,
-              borderRadius: tokens.radii.sm,
-              color: tokens.colors.text.primary,
-              fontFamily: tokens.fonts.body,
-              fontSize: '0.875rem',
-              padding: '8px 12px',
-              outline: 'none',
-              width: '100%',
-              boxSizing: 'border-box',
-            }}
-          >
-            <option value="">— select a KB to browse its items —</option>
-            {kbs.map((kb) => (
-              <option key={kb.id} value={kb.id}>
-                {kb.name} ({kb.item_count} items)
-              </option>
-            ))}
-          </select>
+          <Label>Pick from Dataset (optional)</Label>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <select
+              value={selectedDatasetId}
+              onChange={(e) => setSelectedDatasetId(e.target.value)}
+              style={{
+                background: tokens.colors.bg.tertiary,
+                border: `1px solid ${tokens.colors.border.subtle}`,
+                borderRadius: tokens.radii.sm,
+                color: tokens.colors.text.primary,
+                fontFamily: tokens.fonts.body,
+                fontSize: '0.875rem',
+                padding: '8px 12px',
+                outline: 'none',
+                flex: 1,
+                boxSizing: 'border-box',
+              }}
+            >
+              <option value="">— select a dataset to browse —</option>
+              {datasets.map((ds) => (
+                <option key={ds.id} value={ds.id}>
+                  {ds.name} ({ds.item_count} items)
+                </option>
+              ))}
+            </select>
+          </div>
 
-          {selectedKbId && (
+          {selectedDatasetId && (
             <div style={{
               marginTop: 8,
               background: tokens.colors.bg.primary,
               border: `1px solid ${tokens.colors.border.subtle}`,
               borderRadius: tokens.radii.md,
-              maxHeight: 200,
+              maxHeight: 220,
               overflowY: 'auto',
             }}>
-              {loadingKbItems ? (
+              {loadingItems ? (
                 <div style={{ padding: 12, fontSize: '0.8rem', color: tokens.colors.text.muted }}>
                   Loading items...
                 </div>
-              ) : kbItems.length === 0 ? (
+              ) : datasetItems.length === 0 ? (
                 <div style={{ padding: 12, fontSize: '0.8rem', color: tokens.colors.text.muted }}>
-                  No items in this KB.
+                  No items in this dataset.
                 </div>
               ) : (
-                kbItems.map((item) => {
-                  const isActive = selectedKbItemId === item.id;
+                datasetItems.map((item) => {
+                  const label = item.name || item.content.slice(0, 60) + (item.content.length > 60 ? '…' : '');
                   return (
                     <div
                       key={item.id}
-                      onClick={() => insertKbItem(item)}
+                      onClick={() => pickDatasetItem(item)}
                       title="Click to load this item into the input (replaces current content)"
                       style={{
                         padding: '8px 12px',
@@ -440,40 +485,105 @@ export function InputPanel({ projectId, inputText, onInputTextChange, selectedDo
                         justifyContent: 'space-between',
                         alignItems: 'center',
                         borderBottom: `1px solid ${tokens.colors.border.subtle}`,
-                        color: isActive ? tokens.colors.accent.primary : tokens.colors.text.primary,
+                        color: tokens.colors.text.primary,
                         fontFamily: tokens.fonts.mono,
-                        background: isActive ? 'rgba(108, 92, 231, 0.12)' : 'transparent',
                       }}
-                      onMouseEnter={(e) => {
-                        if (!isActive) e.currentTarget.style.background = tokens.colors.bg.tertiary;
-                      }}
-                      onMouseLeave={(e) => {
-                        if (!isActive) e.currentTarget.style.background = 'transparent';
-                      }}
+                      onMouseEnter={(e) => { e.currentTarget.style.background = tokens.colors.bg.tertiary; }}
+                      onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
                     >
                       <div style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                        {isActive && '✓ '}{item.name}
+                        {label}
                       </div>
-                      <span style={{ fontSize: '0.7rem', color: tokens.colors.text.muted, marginLeft: 8 }}>
-                        <Badge
-                          color={
-                            item.source_type === 'pdf' ? 'primary'
-                            : item.source_type === 'csv_row' ? 'warning'
-                            : 'secondary'
-                          }
-                        >
-                          {item.source_type}
-                        </Badge>
-                        {' '}{item.content.length.toLocaleString()}ch
-                      </span>
+                      {item.tags && (
+                        <span style={{ marginLeft: 8 }}>
+                          <Badge color="secondary">{item.tags}</Badge>
+                        </span>
+                      )}
                     </div>
                   );
                 })
               )}
             </div>
           )}
+        </FormGroup>
+      )}
+
+      {selectedVersion && (
+        <FormGroup>
+          <Label>RAG for this call</Label>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+            <select
+              value={ragMode}
+              onChange={(e) => setRagMode(e.target.value as typeof ragMode)}
+              style={{
+                background: tokens.colors.bg.tertiary,
+                border: `1px solid ${tokens.colors.border.subtle}`,
+                borderRadius: tokens.radii.sm,
+                color: tokens.colors.text.primary,
+                fontFamily: tokens.fonts.body,
+                fontSize: '0.8rem',
+                padding: '6px 10px',
+                outline: 'none',
+              }}
+            >
+              <option value="prompt">
+                Use prompt default {promptKb ? `(${promptKb.name}, top-${selectedVersion.kb_top_k})` : '(none)'}
+              </option>
+              <option value="off">Disable RAG for this call</option>
+              <option value="custom">Override with another KB…</option>
+            </select>
+
+            {ragMode === 'custom' && (
+              <>
+                <select
+                  value={customKbId}
+                  onChange={(e) => setCustomKbId(e.target.value)}
+                  style={{
+                    background: tokens.colors.bg.tertiary,
+                    border: `1px solid ${tokens.colors.border.subtle}`,
+                    borderRadius: tokens.radii.sm,
+                    color: tokens.colors.text.primary,
+                    fontFamily: tokens.fonts.body,
+                    fontSize: '0.8rem',
+                    padding: '6px 10px',
+                    outline: 'none',
+                  }}
+                >
+                  <option value="">select a KB…</option>
+                  {kbs.map((kb) => (
+                    <option key={kb.id} value={kb.id}>
+                      {kb.name} ({kb.chunk_count} chunks)
+                    </option>
+                  ))}
+                </select>
+                <input
+                  type="number"
+                  min={1}
+                  max={20}
+                  value={customTopK}
+                  onChange={(e) => setCustomTopK(Math.max(1, Math.min(20, Number(e.target.value) || 1)))}
+                  style={{
+                    width: 56,
+                    background: tokens.colors.bg.tertiary,
+                    border: `1px solid ${tokens.colors.border.subtle}`,
+                    borderRadius: tokens.radii.sm,
+                    color: tokens.colors.text.primary,
+                    fontFamily: tokens.fonts.mono,
+                    fontSize: '0.8rem',
+                    padding: '6px 8px',
+                    outline: 'none',
+                    textAlign: 'center',
+                  }}
+                  title="top-k"
+                />
+              </>
+            )}
+          </div>
           <div style={{ fontSize: '0.72rem', color: tokens.colors.text.muted, marginTop: 4 }}>
-            Click an item to load it into the text input above (replaces current content).
+            {ragMode === 'off' && 'RAG is off for this call only. Bind a KB in the Prompt & RAG section to make it default-on.'}
+            {ragMode === 'prompt' && !promptKb && 'No KB bound to this prompt version — set one in the Prompt & RAG section above.'}
+            {ragMode === 'prompt' && promptKb && 'Inherits the prompt-version binding.'}
+            {ragMode === 'custom' && 'Overriding the prompt-bound KB for this call only.'}
           </div>
         </FormGroup>
       )}

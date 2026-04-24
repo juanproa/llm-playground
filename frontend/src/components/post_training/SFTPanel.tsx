@@ -299,7 +299,7 @@ function getJobBadgeColor(status: string): 'primary' | 'success' | 'error' | 'se
 export function SFTPanel({ projectId }: Props) {
   const [datasets, setDatasets] = useState<Dataset[]>([]);
   const [trainingJobs, setTrainingJobs] = useState<TrainingJob[]>([]);
-  const [ollamaModels, setOllamaModels] = useState<ModelConfig[]>([]);
+  const [, setOllamaModels] = useState<ModelConfig[]>([]);
   const [selectedDataset, setSelectedDataset] = useState<Dataset | null>(null);
   const [selectedJob, setSelectedJob] = useState<TrainingJob | null>(null);
   const [showJobModal, setShowJobModal] = useState(false);

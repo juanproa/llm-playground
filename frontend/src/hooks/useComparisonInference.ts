@@ -25,6 +25,9 @@ interface ComparisonParams {
   input_text?: string;
   modelA_id: string;
   modelB_id: string;
+  kb_id?: string | null;
+  kb_top_k?: number;
+  rag_override_none?: boolean;
 }
 
 function parseSSELines(buffer: string, handler: (data: Record<string, unknown>) => void): string {
@@ -61,7 +64,15 @@ export function useComparisonInference() {
   const streamOne = async (
     index: 0 | 1,
     projectId: string,
-    body: { prompt_version_id: string; model_config_id: string; document_id?: string; input_text: string },
+    body: {
+      prompt_version_id: string;
+      model_config_id: string;
+      document_id?: string;
+      input_text: string;
+      kb_id?: string | null;
+      kb_top_k?: number;
+      rag_override_none?: boolean;
+    },
     signal: AbortSignal,
   ) => {
     updateSlot(index, { output: '', isStreaming: true, error: null, startedAt: Date.now(), completedAt: null });
@@ -141,11 +152,21 @@ export function useComparisonInference() {
 
     setSlots([{ ...EMPTY_SLOT, isStreaming: true, startedAt: Date.now() }, { ...EMPTY_SLOT, isStreaming: true, startedAt: Date.now() }]);
 
-    const body = {
+    const body: {
+      prompt_version_id: string;
+      document_id?: string;
+      input_text: string;
+      kb_id?: string | null;
+      kb_top_k?: number;
+      rag_override_none?: boolean;
+    } = {
       prompt_version_id: params.prompt_version_id,
       document_id: params.document_id,
       input_text: params.input_text || '',
     };
+    if (params.kb_id !== undefined) body.kb_id = params.kb_id;
+    if (params.kb_top_k !== undefined) body.kb_top_k = params.kb_top_k;
+    if (params.rag_override_none) body.rag_override_none = true;
 
     // Run both in parallel
     const promiseA = streamOne(0, params.projectId, { ...body, model_config_id: params.modelA_id }, controllerA.signal);

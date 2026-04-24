@@ -17,11 +17,19 @@ class PromptVersionCreate(BaseModel):
     content: str
     system_message: str | None = None
     label: str | None = None
+    kb_id: str | None = None
+    kb_top_k: int | None = None
 
 
 class PromptVersionUpdate(BaseModel):
     label: str | None = None
     is_active: bool | None = None
+    # RAG binding is mutable per version (it's not content, so changing it
+    # shouldn't require a new version)
+    kb_id: str | None = None
+    kb_top_k: int | None = None
+    # Sentinel to detach an attached KB (since None on PATCH means "no change")
+    clear_kb: bool | None = None
 
 
 class PromptVersionResponse(BaseModel):
@@ -32,6 +40,8 @@ class PromptVersionResponse(BaseModel):
     content: str
     system_message: str | None
     is_active: bool
+    kb_id: str | None = None
+    kb_top_k: int = 5
     created_at: datetime
 
     model_config = {"from_attributes": True}

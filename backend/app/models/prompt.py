@@ -35,6 +35,11 @@ class PromptVersion(Base):
     content: Mapped[str] = mapped_column(Text, nullable=False)
     system_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Default RAG binding — when an inference request doesn't override kb_id,
+    # the service falls back to these. Mutable (via update_version) since
+    # RAG binding isn't content; changing it doesn't warrant a new version.
+    kb_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    kb_top_k: Mapped[int] = mapped_column(Integer, default=5)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     prompt = relationship("Prompt", back_populates="versions")

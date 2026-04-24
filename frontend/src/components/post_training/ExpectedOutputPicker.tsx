@@ -13,7 +13,7 @@
  * If the expected_output isn't parseable as JSON, the picker hides itself —
  * users add assertions manually in that case.
  */
-import { useMemo } from 'react';
+import { useMemo, type JSX } from 'react';
 import styled from 'styled-components';
 import { tokens } from '../../theme/tokens';
 import type { AssertionSpec } from '../../types';

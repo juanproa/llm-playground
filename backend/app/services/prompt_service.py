@@ -1,7 +1,8 @@
-from sqlalchemy import func, select
+from sqlalchemy import delete as sa_delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.models.inference import InferenceRun
 from app.models.prompt import Prompt, PromptVersion
 from app.schemas.prompt import PromptCreate, PromptUpdate, PromptVersionCreate, PromptVersionUpdate
 
@@ -106,6 +107,63 @@ async def list_versions(db: AsyncSession, prompt_id: str) -> list[PromptVersion]
         .order_by(PromptVersion.version_number.desc())
     )
     return list(result.scalars().all())
+
+
+class PromptVersionDeleteError(Exception):
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
+
+
+async def delete_version(db: AsyncSession, version_id: str) -> bool:
+    version = await db.get(PromptVersion, version_id)
+    if not version:
+        return False
+
+    result = await db.execute(
+        select(func.count()).select_from(PromptVersion).where(PromptVersion.prompt_id == version.prompt_id)
+    )
+    total = result.scalar() or 0
+    if total <= 1:
+        raise PromptVersionDeleteError("Cannot delete the only version of a prompt")
+    if version.is_active:
+        raise PromptVersionDeleteError("Cannot delete the active version; set another version active first")
+
+    # Block deletion when the version is wired into user-curated artifacts
+    # (eval runs, chains, feedback loops). These are explicit decisions a user
+    # made — silently dropping them would erase work. Inference history is
+    # different — it's a passive log of workspace chats and is safe to cascade.
+    blockers = await _count_curated_refs(db, version_id)
+    if blockers:
+        joined = ", ".join(f"{n} {kind}" for kind, n in blockers.items())
+        raise PromptVersionDeleteError(
+            f"Cannot delete: this version is used by {joined}. Delete those first."
+        )
+
+    await db.execute(sa_delete(InferenceRun).where(InferenceRun.prompt_version_id == version_id))
+    await db.delete(version)
+    await db.flush()
+    return True
+
+
+async def _count_curated_refs(db: AsyncSession, version_id: str) -> dict[str, int]:
+    """Count user-curated rows that pin this prompt version. Empty dict ⇒ safe to delete."""
+    # Imported lazily so prompt_service doesn't pull post-training/chain models
+    # at import time (keeps cold start clean and avoids any circular concerns).
+    from app.models.chain import ChainNode
+    from app.models.post_training import BacktestRun, ComparisonRun, FeedbackRun
+
+    blockers: dict[str, int] = {}
+    for kind, model, col in (
+        ("backtest run(s)", BacktestRun, BacktestRun.prompt_version_id),
+        ("comparison run(s)", ComparisonRun, ComparisonRun.prompt_version_id),
+        ("feedback run(s)", FeedbackRun, FeedbackRun.prompt_version_id),
+        ("chain node(s)", ChainNode, ChainNode.prompt_version_id),
+    ):
+        n = (await db.execute(select(func.count()).select_from(model).where(col == version_id))).scalar() or 0
+        if n:
+            blockers[kind] = n
+    return blockers
 
 
 async def update_version(db: AsyncSession, version_id: str, data: PromptVersionUpdate) -> PromptVersion | None:

@@ -38,6 +38,7 @@ export function WorkspaceSubNav({ projectId }: { projectId: string }) {
     <Bar>
       <Link to={`/projects/${projectId}`} end>Workspace</Link>
       <Link to={`/projects/${projectId}/batch-compare`}>Batch Compare</Link>
+      <Link to={`/projects/${projectId}/model-chain`}>Model Chain</Link>
       <Link to={`/projects/${projectId}/post-training`}>Post-Training</Link>
     </Bar>
   );

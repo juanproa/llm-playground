@@ -3,6 +3,7 @@ import type {
   InputDataset,
   InputDatasetItem,
   InputDatasetWithItems,
+  PiiModelStatus,
 } from '../types';
 
 const BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000/api/v1';
@@ -110,4 +111,27 @@ export const inputDatasetsApi = {
       method: 'POST',
       body: JSON.stringify(data ?? {}),
     }),
+
+  retryPending: () =>
+    apiFetch<{ retried_count: number; items: InputDatasetItem[] }>(`/input-datasets/retry-pending`, {
+      method: 'POST',
+    }),
+
+  evaluateQuality: (datasetId: string, modelConfigId: string) =>
+    apiFetch<{ queued_count: number; message: string }>(
+      `/input-datasets/${datasetId}/evaluate-quality?model_config_id=${encodeURIComponent(modelConfigId)}`,
+      { method: 'POST' },
+    ),
+
+  getPiiModelStatus: () =>
+    apiFetch<PiiModelStatus>(`/input-datasets/pii-filter-status`),
+
+  preloadPiiModel: () =>
+    apiFetch<PiiModelStatus>(`/input-datasets/pii-filter-preload`, { method: 'POST' }),
+
+  maskPii: (datasetId: string) =>
+    apiFetch<{ queued_count: number; message: string }>(
+      `/input-datasets/${datasetId}/mask-pii`,
+      { method: 'POST' },
+    ),
 };

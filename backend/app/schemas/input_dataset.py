@@ -23,6 +23,8 @@ class InputDatasetResponse(BaseModel):
     name: str
     description: str | None
     item_count: int
+    eval_status: str = "idle"
+    mask_status: str = "idle"
     created_at: datetime
     updated_at: datetime
 
@@ -56,6 +58,10 @@ class InputDatasetItemResponse(BaseModel):
     file_size_bytes: int | None = None
     parse_status: str = "ready"
     parse_error: str | None = None
+    quality_status: str = "unchecked"
+    quality_reason: str | None = None
+    pii_status: str = "unchecked"
+    pii_masked_content: str | None = None
     created_at: datetime
 
 

@@ -12,14 +12,14 @@ const Overlay = styled.div`
   z-index: 1000;
 `;
 
-const ModalBox = styled.div`
+const ModalBox = styled.div<{ $size?: 'md' | 'lg' }>`
   background: ${tokens.colors.bg.secondary};
   border: 1px solid ${tokens.colors.border.subtle};
   border-radius: ${tokens.radii.xl};
   padding: ${tokens.spacing.xl};
   min-width: 400px;
-  max-width: 600px;
-  max-height: 80vh;
+  max-width: ${({ $size }) => ($size === 'lg' ? '900px' : '600px')};
+  max-height: 85vh;
   overflow-y: auto;
   box-shadow: ${tokens.shadows.elevated};
 `;
@@ -35,13 +35,14 @@ interface ModalProps {
   open: boolean;
   onClose: () => void;
   children: React.ReactNode;
+  size?: 'md' | 'lg';
 }
 
-export function Modal({ title, open, onClose, children }: ModalProps) {
+export function Modal({ title, open, onClose, children, size = 'md' }: ModalProps) {
   if (!open) return null;
   return (
     <Overlay onClick={onClose}>
-      <ModalBox onClick={(e) => e.stopPropagation()}>
+      <ModalBox $size={size} onClick={(e) => e.stopPropagation()}>
         <ModalTitle>{title}</ModalTitle>
         {children}
       </ModalBox>

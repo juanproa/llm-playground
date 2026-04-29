@@ -414,6 +414,7 @@ export function BacktestPanel({ projectId }: Props) {
   const [loading, setLoading] = useState(false);
   const [expandedResultId, setExpandedResultId] = useState<string | null>(null);
   const [expandedCaseId, setExpandedCaseId] = useState<string | null>(null);
+  const [selectedCaseIds, setSelectedCaseIds] = useState<Set<string>>(new Set());
 
   // New test case form
   const [caseName, setCaseName] = useState('');
@@ -482,9 +483,45 @@ export function BacktestPanel({ projectId }: Props) {
     try {
       await postTrainingApi.deleteTestCase(projectId, id);
       setTestCases((prev) => prev.filter((t) => t.id !== id));
+      setSelectedCaseIds((prev) => {
+        if (!prev.has(id)) return prev;
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
       if (expandedCaseId === id) setExpandedCaseId(null);
-    } catch {
-      // silently fail
+    } catch (e) {
+      alert(`Delete failed: ${(e as Error).message}`);
+    }
+  }
+
+  function toggleCaseSelected(id: string) {
+    setSelectedCaseIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  function toggleSelectAllCases() {
+    setSelectedCaseIds((prev) =>
+      prev.size === testCases.length ? new Set() : new Set(testCases.map((t) => t.id)),
+    );
+  }
+
+  async function handleBulkDeleteCases() {
+    const ids = Array.from(selectedCaseIds);
+    if (ids.length === 0) return;
+    if (!confirm(`Delete ${ids.length} test case${ids.length === 1 ? '' : 's'}? This cannot be undone.`)) return;
+    try {
+      await postTrainingApi.bulkDeleteTestCases(projectId, ids);
+      const idSet = new Set(ids);
+      setTestCases((prev) => prev.filter((t) => !idSet.has(t.id)));
+      setSelectedCaseIds(new Set());
+      if (expandedCaseId && idSet.has(expandedCaseId)) setExpandedCaseId(null);
+    } catch (e) {
+      alert(`Bulk delete failed: ${(e as Error).message}`);
     }
   }
 
@@ -573,9 +610,31 @@ export function BacktestPanel({ projectId }: Props) {
       <Panel>
         <PanelHeader>
           <PanelTitle>Test Cases ({testCases.length})</PanelTitle>
-          <Button size="sm" onClick={() => setShowCaseForm((v) => !v)}>
-            {showCaseForm ? 'Cancel' : '+ New Case'}
-          </Button>
+          <Row style={{ gap: 8 }}>
+            {testCases.length > 0 && (
+              <CheckboxRow style={{ marginRight: 4 }}>
+                <input
+                  type="checkbox"
+                  checked={selectedCaseIds.size > 0 && selectedCaseIds.size === testCases.length}
+                  ref={(el) => {
+                    if (el)
+                      el.indeterminate =
+                        selectedCaseIds.size > 0 && selectedCaseIds.size < testCases.length;
+                  }}
+                  onChange={toggleSelectAllCases}
+                />
+                Select all
+              </CheckboxRow>
+            )}
+            {selectedCaseIds.size > 0 && (
+              <Button size="sm" variant="danger" onClick={handleBulkDeleteCases}>
+                Delete ({selectedCaseIds.size})
+              </Button>
+            )}
+            <Button size="sm" onClick={() => setShowCaseForm((v) => !v)}>
+              {showCaseForm ? 'Cancel' : '+ New Case'}
+            </Button>
+          </Row>
         </PanelHeader>
         <PanelBody>
           {showCaseForm && (
@@ -644,7 +703,13 @@ export function BacktestPanel({ projectId }: Props) {
                 onClick={() => setExpandedCaseId(isExpanded ? null : tc.id)}
               >
                 <Row style={{ justifyContent: 'space-between', marginBottom: 2 }}>
-                  <CardTitle>
+                  <CardTitle style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <input
+                      type="checkbox"
+                      checked={selectedCaseIds.has(tc.id)}
+                      onChange={() => toggleCaseSelected(tc.id)}
+                      onClick={(e) => e.stopPropagation()}
+                    />
                     <span style={{ marginRight: 6, fontSize: '0.7rem', opacity: 0.5 }}>
                       {isExpanded ? '▼' : '▶'}
                     </span>

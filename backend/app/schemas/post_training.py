@@ -212,6 +212,7 @@ class TestCaseResponse(BaseModel):
     is_golden: bool
     document_id: str | None
     source_kb_item_id: str | None = None
+    source_input_dataset_item_id: str | None = None
     assertions: str | None = None  # raw JSON string; frontend parses it
     pass_threshold: float | None = None
     created_at: datetime
@@ -352,20 +353,84 @@ class HfModelInfo(BaseModel):
     family: str
 
 
-# ─── Comparison Run ──────────────────────────────────────────────────────────
+# ─── Comparison Run (Batch Compare — hard-split from Backtest) ──────────────
+#
+# Unlike Backtest, Batch Compare:
+#   • has no curated TestCases — inputs are ad-hoc text or pulled from an
+#     InputDataset, stored in pt_comparison_input_items
+#   • has no assertions / pass thresholds — judge model is optional
+#   • supports two column kinds: 'model' (prompt+model) and 'chain'
+#
+# Wire shape:
+#   ComparisonRunWithChildrenResponse
+#     ├── input_items: ComparisonInputItemResponse[]
+#     └── children: ComparisonChildResponse[]
+#           └── results: ComparisonResultResponse[]   (one per input_item)
+
 
 class ComparisonRunCreate(BaseModel):
     name: str
-    prompt_version_id: str
-    model_config_ids: list[str]  # two or more model ids
-    # Inputs — use ONE of these two:
-    #   knowledge_base_item_ids: pull inputs from a KB; auto-creates (or reuses)
-    #     TestCases linked back via source_kb_item_id
-    #   test_case_ids: legacy path, reuse existing test cases directly
-    # If both are empty/None, uses all project test cases (same as before).
-    knowledge_base_item_ids: list[str] | None = None
-    test_case_ids: list[str] | None = None
+    # Default prompt for model children that don't have an override.
+    # Required when at least one model_config_id is present without an override.
+    prompt_version_id: str | None = None
+    model_config_ids: list[str] = []
+    chain_ids: list[str] | None = None
+    # Optional per-model prompt overrides — {model_config_id: prompt_version_id}
+    prompt_version_overrides: dict[str, str] | None = None
+    # Inputs — use ONE of these:
+    #   input_dataset_id [+ optional input_dataset_item_ids]: pull rows from
+    #     the global InputDataset table (`input_datasets` — NOT `pt_datasets`).
+    #   input_texts: ad-hoc free-text rows entered by the user.
+    # Required: at least one row.
+    input_dataset_id: str | None = None
+    input_dataset_item_ids: list[str] | None = None
+    input_texts: list[str] | None = None
     judge_model_config_id: str | None = None
+
+
+class ComparisonInputItemResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    comparison_run_id: str
+    input_text: str
+    name: str | None = None
+    source_input_dataset_item_id: str | None = None
+    ordering: int
+    created_at: datetime
+
+
+class ComparisonResultResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    child_id: str
+    input_item_id: str
+    actual_output: str | None
+    status: str  # pending, completed, failed, no_judgment, cancelled
+    pass_score: float | None
+    latency_ms: int | None
+    cache_hit: bool = False
+    error_message: str | None
+    created_at: datetime
+
+
+class ComparisonChildResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    comparison_run_id: str
+    kind: str  # 'model' | 'chain'
+    model_config_id: str | None
+    prompt_version_id: str | None
+    chain_id: str | None
+    status: str
+    error_message: str | None
+    ordering: int
+    started_at: datetime | None
+    completed_at: datetime | None
+    created_at: datetime
+    results: list[ComparisonResultResponse] = []
 
 
 class ComparisonRunResponse(BaseModel):
@@ -374,10 +439,7 @@ class ComparisonRunResponse(BaseModel):
     id: str
     project_id: str
     name: str
-    prompt_version_id: str
-    model_config_ids: str  # JSON string; frontend parses
-    test_case_ids: str | None
-    child_backtest_run_ids: str | None
+    prompt_version_id: str  # default prompt (FK still NOT NULL on legacy table)
     judge_model_config_id: str | None
     status: str
     error_message: str | None
@@ -387,5 +449,6 @@ class ComparisonRunResponse(BaseModel):
 
 
 class ComparisonRunWithChildrenResponse(ComparisonRunResponse):
-    """Embeds fully-resolved child backtest runs for the matrix view."""
-    children: list[BacktestRunWithResultsResponse] = []
+    """Full matrix payload — children (columns) × input_items (rows)."""
+    input_items: list[ComparisonInputItemResponse] = []
+    children: list[ComparisonChildResponse] = []

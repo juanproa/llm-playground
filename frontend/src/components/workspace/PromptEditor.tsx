@@ -34,7 +34,7 @@ export function PromptEditor({ projectId, prompts, selectedPrompt, selectedVersi
   const [newName, setNewName] = useState('');
   const [newContent, setNewContent] = useState('');
   const [newSystem, setNewSystem] = useState('');
-  const { createPrompt, createVersion, deletePrompt, fetchPrompts } = usePromptStore();
+  const { createPrompt, createVersion, deletePrompt, deleteVersion, fetchPrompts } = usePromptStore();
   const [editedContent, setEditedContent] = useState('');
   const [editedSystem, setEditedSystem] = useState('');
   const [dirty, setDirty] = useState(false);
@@ -82,6 +82,31 @@ export function PromptEditor({ projectId, prompts, selectedPrompt, selectedVersi
     setEditedContent(version?.content || '');
     setEditedSystem(version?.system_message || '');
     setDirty(false);
+  };
+
+  const handleDeleteVersion = async () => {
+    if (!selectedPrompt || !selectedVersion) return;
+    if (selectedPrompt.versions.length <= 1) {
+      alert('Cannot delete the only version of a prompt.');
+      return;
+    }
+    if (selectedVersion.is_active) {
+      alert('Cannot delete the active version. Set another version active first.');
+      return;
+    }
+    if (!confirm(`Delete version v${selectedVersion.version_number}?`)) return;
+    try {
+      const updatedPrompt = await deleteVersion(selectedPrompt.id, selectedVersion.id);
+      onSelectPrompt(updatedPrompt);
+      const next =
+        updatedPrompt.versions.find((v) => v.is_active) || updatedPrompt.versions[0] || null;
+      onSelectVersion(next);
+      syncEditorToVersion(next);
+      await fetchPrompts(projectId);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to delete version';
+      alert(message);
+    }
   };
 
   const handleDeletePrompt = async () => {
@@ -188,6 +213,27 @@ export function PromptEditor({ projectId, prompts, selectedPrompt, selectedVersi
                 setShowNewVersion(true);
               }}>
                 New Version
+              </Button>
+              <Button
+                size="sm"
+                variant="danger"
+                onClick={handleDeleteVersion}
+                disabled={
+                  !selectedVersion ||
+                  selectedPrompt.versions.length <= 1 ||
+                  selectedVersion.is_active
+                }
+                title={
+                  !selectedVersion
+                    ? ''
+                    : selectedPrompt.versions.length <= 1
+                    ? 'Cannot delete the only version'
+                    : selectedVersion.is_active
+                    ? 'Cannot delete the active version'
+                    : 'Delete this version'
+                }
+              >
+                Delete Version
               </Button>
             </VersionSelector>
           )}

@@ -132,8 +132,12 @@ class TestCase(Base):
     is_golden: Mapped[bool] = mapped_column(default=False)
     document_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("documents.id"), nullable=True)
     # Back-link to the knowledge-base item this case was materialised from (if any).
-    # Batch Compare uses this for idempotent test-case creation from KB items.
+    # Legacy: KB items used to be the input source for Batch Compare.
     source_kb_item_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    # Back-link to the InputDataset item this case was materialised from. Batch Compare
+    # uses this for idempotent test-case creation when an InputDataset feeds the run.
+    # NB: this points at `input_dataset_items.id` — NOT `pt_dataset_items.id` (SFT).
+    source_input_dataset_item_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     # JSON array of assertion specs; null → fall back to legacy whole-output scoring
     assertions: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Per-test-case pass threshold (0.0-1.0) when assertions are present.
@@ -230,14 +234,89 @@ class ComparisonRun(Base):
     prompt_version_id: Mapped[str] = mapped_column(String(36), ForeignKey("prompt_versions.id"), nullable=False)
     # JSON arrays
     model_config_ids: Mapped[str] = mapped_column(Text, nullable=False)  # JSON list
+    # Chain columns selected for this run. JSON list of chain_ids; null/empty = none.
+    # Chain children are tracked alongside model children in `child_backtest_run_ids`
+    # — the BacktestRun rows themselves carry `chain_id` to disambiguate.
+    chain_ids: Mapped[str | None] = mapped_column(Text, nullable=True)
     test_case_ids: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON list; null = all
     child_backtest_run_ids: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON list
+    # Optional per-model prompt overrides — JSON dict {model_config_id: prompt_version_id}.
+    # When a model id is present here, its child run uses the override instead of
+    # the parent prompt_version_id. Lets you compare a small model's tuned prompt
+    # against a frontier model's tighter prompt in the same run.
+    prompt_version_overrides: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     judge_model_config_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("model_configs.id"), nullable=True)
     status: Mapped[str] = mapped_column(String(50), default="pending")
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+# ─── Comparison children/results/inputs (Batch Compare, hard-split) ─────────
+# These tables are owned by Batch Compare. They intentionally do NOT reuse
+# pt_backtest_runs / pt_test_cases / pt_backtest_results — Backtest is a
+# separate user flow (assertions, pass thresholds, curated test cases) and
+# leaking comparison runs into it polluted that surface.
+
+class ComparisonInputItem(Base):
+    """One input row in a comparison run (row dimension of the matrix)."""
+    __tablename__ = "pt_comparison_input_items"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    comparison_run_id: Mapped[str] = mapped_column(String(36), ForeignKey("pt_comparison_runs.id"), nullable=False)
+    input_text: Mapped[str] = mapped_column(Text, nullable=False)
+    # Display label, copied from InputDatasetItem.name at create time. Null
+    # when the row came from `input_texts` (ad-hoc) or the source item had no
+    # name. Denormalized so the matrix renders without a join back to the
+    # source dataset (which may be deleted later).
+    name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Optional back-link to the InputDataset item this row was sourced from.
+    # Points at `input_dataset_items.id` — NOT `pt_dataset_items.id` (SFT).
+    source_input_dataset_item_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    ordering: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+class ComparisonChild(Base):
+    """One column of a comparison run — discriminated by `kind`.
+
+    kind='model' → uses model_config_id + prompt_version_id.
+    kind='chain' → uses chain_id (the other two are null)."""
+    __tablename__ = "pt_comparison_children"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    comparison_run_id: Mapped[str] = mapped_column(String(36), ForeignKey("pt_comparison_runs.id"), nullable=False)
+    kind: Mapped[str] = mapped_column(String(20), nullable=False)
+    model_config_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("model_configs.id"), nullable=True)
+    prompt_version_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("prompt_versions.id"), nullable=True)
+    chain_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("chains.id"), nullable=True)
+    status: Mapped[str] = mapped_column(String(50), default="pending")
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    ordering: Mapped[int] = mapped_column(Integer, default=0)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    model_config = relationship("ModelConfig")
+    prompt_version = relationship("PromptVersion")
+
+
+class ComparisonResult(Base):
+    """One cell of a comparison run — one input × one column."""
+    __tablename__ = "pt_comparison_results"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    child_id: Mapped[str] = mapped_column(String(36), ForeignKey("pt_comparison_children.id"), nullable=False)
+    input_item_id: Mapped[str] = mapped_column(String(36), ForeignKey("pt_comparison_input_items.id"), nullable=False)
+    actual_output: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # pending, completed, failed, no_judgment
+    status: Mapped[str] = mapped_column(String(50), default="pending")
+    pass_score: Mapped[float | None] = mapped_column(nullable=True)
+    latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cache_hit: Mapped[bool] = mapped_column(default=False)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 

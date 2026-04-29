@@ -10,6 +10,7 @@ import { ProjectWorkspacePage } from './pages/ProjectWorkspacePage';
 import { PostTrainingPage } from './pages/PostTrainingPage';
 import { ModelFusionPage } from './pages/ModelFusionPage';
 import { BatchComparePage } from './pages/BatchComparePage';
+import { ModelChainPage } from './pages/ModelChainPage';
 import { ChatPage } from './pages/ChatPage';
 import { KnowledgeBasePage } from './pages/KnowledgeBasePage';
 import { DatasetsPage } from './pages/DatasetsPage';
@@ -35,6 +36,7 @@ export function App() {
               <Route path="/post-training" element={<ProjectsListPage />} />
               <Route path="/projects/:projectId" element={<ProjectWorkspacePage />} />
               <Route path="/projects/:projectId/batch-compare" element={<BatchComparePage />} />
+              <Route path="/projects/:projectId/model-chain" element={<ModelChainPage />} />
               <Route path="/projects/:projectId/post-training" element={<PostTrainingPage />} />
               <Route path="/model-fusion" element={<ModelFusionPage />} />
               <Route path="/knowledge-base" element={<KnowledgeBasePage />} />

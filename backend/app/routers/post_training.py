@@ -14,6 +14,9 @@ from app.dependencies import get_db
 from app.models.post_training import (
     BacktestResult,
     BacktestRun,
+    ComparisonChild,
+    ComparisonInputItem,
+    ComparisonResult,
     ComparisonRun,
     Dataset,
     DatasetItem,
@@ -629,7 +632,38 @@ async def delete_test_case(
     tc = await db.get(TestCase, tc_id)
     if not tc or tc.project_id != project_id:
         raise HTTPException(status_code=404, detail="Test case not found")
+    # BacktestResult has a NOT NULL FK to TestCase with no ON DELETE CASCADE,
+    # so SQLite (foreign_keys=ON) rejects the delete unless we clear children
+    # first. This is what made the old endpoint silently 500.
+    await db.execute(delete(BacktestResult).where(BacktestResult.test_case_id == tc_id))
     await db.delete(tc)
+    await db.flush()
+
+
+@router.post(f"{PREFIX}/test-cases/bulk-delete", status_code=204)
+async def bulk_delete_test_cases(
+    project_id: str,
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete many test cases at once. Body: {"ids": ["...", "..."]}.
+
+    Used by the "select all + delete" feature in the Backtest panel. Same
+    BacktestResult cascade applies.
+    """
+    ids = data.get("ids") or []
+    if not isinstance(ids, list) or not ids:
+        raise HTTPException(status_code=400, detail="ids must be a non-empty list")
+
+    result = await db.execute(
+        select(TestCase).where(TestCase.project_id == project_id, TestCase.id.in_(ids))
+    )
+    cases = list(result.scalars().all())
+    if not cases:
+        return
+    case_ids = [c.id for c in cases]
+    await db.execute(delete(BacktestResult).where(BacktestResult.test_case_id.in_(case_ids)))
+    await db.execute(delete(TestCase).where(TestCase.id.in_(case_ids)))
     await db.flush()
 
 
@@ -781,9 +815,12 @@ async def create_comparison_run(
             name=data.name,
             prompt_version_id=data.prompt_version_id,
             model_config_ids=data.model_config_ids,
-            test_case_ids=data.test_case_ids,
-            knowledge_base_item_ids=data.knowledge_base_item_ids,
+            chain_ids=data.chain_ids,
+            input_dataset_id=data.input_dataset_id,
+            input_dataset_item_ids=data.input_dataset_item_ids,
+            input_texts=data.input_texts,
             judge_model_config_id=data.judge_model_config_id,
+            prompt_version_overrides=data.prompt_version_overrides,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -810,21 +847,34 @@ async def get_comparison_run(project_id: str, comparison_id: str, db: AsyncSessi
     return data
 
 
-@router.delete(f"{PREFIX}/comparison-runs/{{comparison_id}}", status_code=204)
-async def delete_comparison_run(project_id: str, comparison_id: str, db: AsyncSession = Depends(get_db)):
-    import json as _json
+@router.post(f"{PREFIX}/comparison-runs/{{comparison_id}}/cancel", response_model=ComparisonRunResponse)
+async def cancel_comparison_run(project_id: str, comparison_id: str, db: AsyncSession = Depends(get_db)):
+    """Stop an in-progress ComparisonRun. Marks parent + children as 'cancelling';
+    the executor finalizes them as 'cancelled' between cases. Idempotent."""
     parent = await db.get(ComparisonRun, comparison_id)
     if not parent or parent.project_id != project_id:
         raise HTTPException(status_code=404, detail="Comparison run not found")
-    # Cascade-delete child backtest runs too
-    try:
-        child_ids = _json.loads(parent.child_backtest_run_ids or "[]")
-    except Exception:
-        child_ids = []
-    for cid in child_ids:
-        child = await db.get(BacktestRun, cid)
-        if child:
-            await db.delete(child)
+    updated = await comparison_service.cancel_comparison_run(db, comparison_id)
+    return updated
+
+
+@router.delete(f"{PREFIX}/comparison-runs/{{comparison_id}}", status_code=204)
+async def delete_comparison_run(project_id: str, comparison_id: str, db: AsyncSession = Depends(get_db)):
+    parent = await db.get(ComparisonRun, comparison_id)
+    if not parent or parent.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Comparison run not found")
+    # Cascade across the new comparison tables. Backtest tables are not touched.
+    children = (await db.execute(
+        select(ComparisonChild).where(ComparisonChild.comparison_run_id == comparison_id)
+    )).scalars().all()
+    for child in children:
+        await db.execute(
+            delete(ComparisonResult).where(ComparisonResult.child_id == child.id)
+        )
+        await db.delete(child)
+    await db.execute(
+        delete(ComparisonInputItem).where(ComparisonInputItem.comparison_run_id == comparison_id)
+    )
     await db.delete(parent)
 
 

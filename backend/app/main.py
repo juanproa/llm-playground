@@ -8,7 +8,7 @@ from sqlalchemy import text
 
 from app.config import settings
 from app.database import Base, engine
-from app.routers import health, projects, prompts, documents, models, inference, post_training, knowledge_base, chat, input_datasets
+from app.routers import health, projects, prompts, documents, models, inference, post_training, knowledge_base, chat, input_datasets, chains
 
 # Import post-training models so Base.metadata.create_all picks them up
 from app.models.post_training import (  # noqa: F401
@@ -23,10 +23,14 @@ from app.models.post_training import (  # noqa: F401
     FusionJob,
     InferenceCache,
     ComparisonRun,
+    ComparisonChild,
+    ComparisonResult,
+    ComparisonInputItem,
 )
 from app.models.knowledge_base import KnowledgeBase, KnowledgeBaseItem, KnowledgeBaseChunk  # noqa: F401
 from app.models.input_dataset import InputDataset, InputDatasetItem  # noqa: F401
 from app.models.chat import ChatSession, ChatMessage  # noqa: F401
+from app.models.chain import Chain, ChainNode, ChainEdge, ChainRun, ChainNodeRun  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +44,7 @@ def _run_migrations(conn) -> None:
         ("pt_test_cases", "assertions", "ALTER TABLE pt_test_cases ADD COLUMN assertions TEXT"),
         ("pt_test_cases", "pass_threshold", "ALTER TABLE pt_test_cases ADD COLUMN pass_threshold FLOAT"),
         ("pt_test_cases", "source_kb_item_id", "ALTER TABLE pt_test_cases ADD COLUMN source_kb_item_id VARCHAR(36)"),
+        ("pt_test_cases", "source_input_dataset_item_id", "ALTER TABLE pt_test_cases ADD COLUMN source_input_dataset_item_id VARCHAR(36)"),
         ("pt_backtest_results", "assertion_results", "ALTER TABLE pt_backtest_results ADD COLUMN assertion_results TEXT"),
         ("pt_backtest_results", "cache_hit", "ALTER TABLE pt_backtest_results ADD COLUMN cache_hit BOOLEAN DEFAULT 0"),
         # Knowledge Base RAG columns — added when RAG support was introduced.
@@ -65,6 +70,32 @@ def _run_migrations(conn) -> None:
         ("input_dataset_items", "file_size_bytes", "ALTER TABLE input_dataset_items ADD COLUMN file_size_bytes INTEGER"),
         ("input_dataset_items", "parse_status", "ALTER TABLE input_dataset_items ADD COLUMN parse_status VARCHAR(20) DEFAULT 'ready'"),
         ("input_dataset_items", "parse_error", "ALTER TABLE input_dataset_items ADD COLUMN parse_error TEXT"),
+        # Chain node now carries an optional document attachment alongside text input
+        ("chain_nodes", "input_document_id", "ALTER TABLE chain_nodes ADD COLUMN input_document_id VARCHAR(36)"),
+        # Explicit RAG retrieval-query template per chain node (supports {{node.output}} refs).
+        ("chain_nodes", "kb_query_template", "ALTER TABLE chain_nodes ADD COLUMN kb_query_template TEXT"),
+        # Chain runs gain a compiled JSON of every node's output (used as the chain's "single result").
+        ("chain_runs", "final_output", "ALTER TABLE chain_runs ADD COLUMN final_output TEXT"),
+        # Per-model prompt overrides on a comparison run
+        ("pt_comparison_runs", "prompt_version_overrides", "ALTER TABLE pt_comparison_runs ADD COLUMN prompt_version_overrides TEXT"),
+        # Track file paths for PDFs so we can retry parsing
+        ("input_dataset_items", "file_path", "ALTER TABLE input_dataset_items ADD COLUMN file_path VARCHAR(500)"),
+        # LLM-driven quality evaluation on parsed items
+        ("input_dataset_items", "quality_status", "ALTER TABLE input_dataset_items ADD COLUMN quality_status VARCHAR(20) DEFAULT 'unchecked'"),
+        ("input_dataset_items", "quality_reason", "ALTER TABLE input_dataset_items ADD COLUMN quality_reason TEXT"),
+        ("input_datasets", "eval_status", "ALTER TABLE input_datasets ADD COLUMN eval_status VARCHAR(20) DEFAULT 'idle'"),
+        ("input_dataset_items", "pii_status", "ALTER TABLE input_dataset_items ADD COLUMN pii_status VARCHAR(20) DEFAULT 'unchecked'"),
+        ("input_dataset_items", "pii_masked_content", "ALTER TABLE input_dataset_items ADD COLUMN pii_masked_content TEXT"),
+        ("input_datasets", "mask_status", "ALTER TABLE input_datasets ADD COLUMN mask_status VARCHAR(20) DEFAULT 'idle'"),
+        # Batch Compare can use a Chain as a column (one chain == one runnable producing
+        # one output per test case). chain_id on the BacktestRun child + chain_ids JSON
+        # list on the parent ComparisonRun parallel the existing model_config columns.
+        ("pt_backtest_runs", "chain_id", "ALTER TABLE pt_backtest_runs ADD COLUMN chain_id VARCHAR(36)"),
+        ("pt_comparison_runs", "chain_ids", "ALTER TABLE pt_comparison_runs ADD COLUMN chain_ids TEXT"),
+        # Per-run override for a chain's root input — Batch Compare feeds TestCase.input_text in here.
+        ("chain_runs", "input_override", "ALTER TABLE chain_runs ADD COLUMN input_override TEXT"),
+        # Display label for Batch Compare rows, copied from InputDatasetItem.name at create time.
+        ("pt_comparison_input_items", "name", "ALTER TABLE pt_comparison_input_items ADD COLUMN name VARCHAR(255)"),
     ]
     for table, column, ddl in migrations:
         try:
@@ -75,6 +106,43 @@ def _run_migrations(conn) -> None:
                 logger.info("Migration: added %s.%s", table, column)
             except Exception as e:
                 logger.warning("Migration failed for %s.%s: %s", table, column, e)
+
+    # One-shot cleanup: Batch Compare used to write into pt_backtest_runs /
+    # pt_test_cases, polluting the Backtest UI. The schema is now hard-split
+    # into pt_comparison_children / _results / _input_items. Old comparison
+    # runs can't be displayed under the new code, so drop them along with
+    # the BacktestRun rows they spawned. Idempotent.
+    import json as _json
+    stale_comparison_ids = [
+        "36a72970-8ac1-4537-bc0b-f0a3d2f63412",
+        "e182c072-f147-4bac-a51a-25e8e0c76bb9",
+        "842f1a4a-e0e1-46ca-9b38-03c7c2c3047b",
+    ]
+    try:
+        bt_ids: list[str] = []
+        removed = 0
+        for cid in stale_comparison_ids:
+            row = conn.execute(
+                text("SELECT child_backtest_run_ids FROM pt_comparison_runs WHERE id = :id"),
+                {"id": cid},
+            ).fetchone()
+            if not row:
+                continue
+            removed += 1
+            (raw,) = row
+            if raw:
+                try:
+                    bt_ids.extend(_json.loads(raw) or [])
+                except Exception:
+                    pass
+            conn.execute(text("DELETE FROM pt_comparison_runs WHERE id = :id"), {"id": cid})
+        for bid in bt_ids:
+            conn.execute(text("DELETE FROM pt_backtest_results WHERE backtest_run_id = :id"), {"id": bid})
+            conn.execute(text("DELETE FROM pt_backtest_runs WHERE id = :id"), {"id": bid})
+        if removed:
+            logger.info("Cleanup: removed %d stale Batch-Compare comparison runs", removed)
+    except Exception as e:
+        logger.warning("Stale-comparison cleanup skipped: %s", e)
 
 
 @asynccontextmanager
@@ -112,3 +180,4 @@ app.include_router(post_training.router, prefix="/api/v1")
 app.include_router(knowledge_base.router, prefix="/api/v1")
 app.include_router(input_datasets.router, prefix="/api/v1")
 app.include_router(chat.router, prefix="/api/v1")
+app.include_router(chains.router, prefix="/api/v1")

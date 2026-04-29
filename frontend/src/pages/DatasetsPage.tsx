@@ -5,10 +5,13 @@ import { Button } from '../components/common/Button';
 import { Badge } from '../components/common/Badge';
 import { TopBar } from '../components/layout/TopBar';
 import { inputDatasetsApi } from '../api/inputDatasets';
+import { modelsApi } from '../api/models';
 import type {
   InputDataset,
   InputDatasetItem,
   InputDatasetWithItems,
+  ModelConfig,
+  PiiModelStatus,
 } from '../types';
 
 const Page = styled.div`
@@ -207,6 +210,13 @@ export function DatasetsPage() {
   const [pdfName, setPdfName] = useState('');
   const [pdfTags, setPdfTags] = useState('');
   const [uploading, setUploading] = useState(false);
+  const [retrying, setRetrying] = useState(false);
+  const [models, setModels] = useState<ModelConfig[]>([]);
+  const [evalModelId, setEvalModelId] = useState('');
+  const [evaluating, setEvaluating] = useState(false);
+  const [masking, setMasking] = useState(false);
+  const [piiModelStatus, setPiiModelStatus] = useState<PiiModelStatus | null>(null);
+  const [preloadingPii, setPreloadingPii] = useState(false);
   const csvRef = useRef<HTMLInputElement>(null);
   const pdfRef = useRef<HTMLInputElement>(null);
   const batchPdfRef = useRef<HTMLInputElement>(null);
@@ -235,19 +245,46 @@ export function DatasetsPage() {
   }, [loadAll]);
 
   useEffect(() => {
+    modelsApi.list()
+      .then((list) => {
+        const enabled = list.filter(
+          (m) => m.is_enabled && !/embed/i.test(m.model_id) && !/embed/i.test(m.name),
+        );
+        setModels(enabled);
+        if (enabled.length > 0) setEvalModelId((curr) => curr || enabled[0].id);
+      })
+      .catch(() => setModels([]));
+  }, []);
+
+  useEffect(() => {
     if (selectedId) loadSelected(selectedId);
   }, [selectedId, loadSelected]);
 
-  // Poll while any PDF item is still parsing
+  // Poll while any PDF item is still parsing OR evaluation/masking is running
   useEffect(() => {
     if (!selected) return;
     const hasPending = selected.items.some((it) => it.parse_status === 'pending');
-    if (!hasPending) return;
+    const isEvaluating = selected.eval_status === 'running';
+    const isMasking = selected.mask_status === 'running';
+    if (!hasPending && !isEvaluating && !isMasking) return;
     const t = setInterval(() => {
       if (selectedId) loadSelected(selectedId);
     }, 2500);
     return () => clearInterval(t);
   }, [selected, selectedId, loadSelected]);
+
+  // Load PII model status on mount, then poll while preload is running
+  useEffect(() => {
+    inputDatasetsApi.getPiiModelStatus().then(setPiiModelStatus).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (piiModelStatus?.preload_state !== 'running') return;
+    const t = setInterval(() => {
+      inputDatasetsApi.getPiiModelStatus().then(setPiiModelStatus).catch(() => {});
+    }, 2000);
+    return () => clearInterval(t);
+  }, [piiModelStatus?.preload_state]);
 
   async function handleSubmit() {
     if (!name.trim()) return;
@@ -363,6 +400,63 @@ export function DatasetsPage() {
       await loadAll();
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed');
+    }
+  }
+
+  async function handleRetryPending() {
+    setRetrying(true);
+    setError(null);
+    try {
+      const result = await inputDatasetsApi.retryPending();
+      if (result.retried_count > 0) {
+        await loadAll();
+        if (selectedId) await loadSelected(selectedId);
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Retry failed');
+    } finally {
+      setRetrying(false);
+    }
+  }
+
+  async function handleEvaluateQuality() {
+    if (!selected || !evalModelId) return;
+    setEvaluating(true);
+    setError(null);
+    try {
+      await inputDatasetsApi.evaluateQuality(selected.id, evalModelId);
+      // Refresh immediately so eval_status='running' propagates and polling kicks in
+      if (selectedId) await loadSelected(selectedId);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Evaluation failed');
+    } finally {
+      setEvaluating(false);
+    }
+  }
+
+  async function handlePreloadPiiModel() {
+    setPreloadingPii(true);
+    try {
+      const status = await inputDatasetsApi.preloadPiiModel();
+      setPiiModelStatus(status);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Preload failed');
+    } finally {
+      setPreloadingPii(false);
+    }
+  }
+
+  async function handleMaskPii() {
+    if (!selected) return;
+    setMasking(true);
+    setError(null);
+    try {
+      await inputDatasetsApi.maskPii(selected.id);
+      if (selectedId) await loadSelected(selectedId);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'PII masking failed');
+    } finally {
+      setMasking(false);
     }
   }
 
@@ -489,9 +583,90 @@ export function DatasetsPage() {
                     {selected.description && ` · ${selected.description}`}
                   </CardMeta>
                 </div>
-                <Button size="sm" variant="ghost" onClick={() => loadSelected(selected.id)}>
-                  Refresh
-                </Button>
+                <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                  {selected.items.some((it) => it.parse_status === 'pending') && (
+                    <Button size="sm" variant="primary" onClick={handleRetryPending} disabled={retrying}>
+                      {retrying ? 'Resuming...' : 'Resume'}
+                    </Button>
+                  )}
+                  {!selected.items.some((it) => it.parse_status === 'pending') && selected.items.some((it) => it.parse_status === 'ready') && (() => {
+                    const isEvalRunning = selected.eval_status === 'running' || evaluating;
+                    const isMaskRunning = selected.mask_status === 'running' || masking;
+                    const isAnyRunning = isEvalRunning || isMaskRunning;
+                    const total = selected.items.filter((it) => it.parse_status === 'ready').length;
+                    const evalDone = selected.items.filter((it) => it.parse_status === 'ready' && it.quality_status !== 'unchecked').length;
+                    const maskDone = selected.items.filter((it) => it.parse_status === 'ready' && it.pii_status !== 'unchecked').length;
+                    const piiLoaded = piiModelStatus?.loaded ?? false;
+                    const piiPreloading = piiModelStatus?.preload_state === 'running' || preloadingPii;
+                    const piiError = piiModelStatus?.preload_state === 'error';
+                    return (
+                      <>
+                        {selected.items.some((it) => it.source_type === 'pdf') && (
+                          <>
+                            <select
+                              value={evalModelId}
+                              onChange={(e) => setEvalModelId(e.target.value)}
+                              disabled={isAnyRunning}
+                              style={{
+                                background: tokens.colors.bg.tertiary,
+                                color: tokens.colors.text.primary,
+                                border: `1px solid ${tokens.colors.border.subtle}`,
+                                borderRadius: tokens.radii.sm,
+                                padding: '6px 8px',
+                                fontSize: '0.78rem',
+                                fontFamily: tokens.fonts.mono,
+                                maxWidth: 220,
+                                opacity: isAnyRunning ? 0.5 : 1,
+                              }}
+                            >
+                              {models.length === 0 && <option value="">No models</option>}
+                              {models.map((m) => (
+                                <option key={m.id} value={m.id}>{m.name}</option>
+                              ))}
+                            </select>
+                            <Button
+                              size="sm"
+                              variant="primary"
+                              onClick={handleEvaluateQuality}
+                              disabled={isAnyRunning || !evalModelId}
+                            >
+                              {isEvalRunning ? `Evaluating (${evalDone}/${total})` : 'Evaluate Quality'}
+                            </Button>
+                          </>
+                        )}
+                        {/* PII masking — uses fixed local model, gated on preload */}
+                        {!piiLoaded && !piiPreloading && (
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            onClick={handlePreloadPiiModel}
+                            title="Download and load the privacy-filter model (~2.8 GB)"
+                          >
+                            {piiError ? 'Retry PII Model' : 'Load PII Model'}
+                          </Button>
+                        )}
+                        {piiPreloading && (
+                          <span style={{ fontSize: '0.78rem', color: tokens.colors.text.muted, fontFamily: tokens.fonts.mono }}>
+                            Loading PII model…
+                          </span>
+                        )}
+                        {piiLoaded && (
+                          <Button
+                            size="sm"
+                            variant="primary"
+                            onClick={handleMaskPii}
+                            disabled={isAnyRunning}
+                          >
+                            {isMaskRunning ? `Masking PII (${maskDone}/${total})` : 'Mask PII'}
+                          </Button>
+                        )}
+                      </>
+                    );
+                  })()}
+                  <Button size="sm" variant="ghost" onClick={() => loadSelected(selected.id)}>
+                    Refresh
+                  </Button>
+                </div>
               </PanelHeader>
 
               <TabBar>
@@ -696,6 +871,36 @@ export function DatasetsPage() {
                                   </Badge>
                                 </>
                               )}
+                              {item.quality_status === 'good' && (
+                                <>
+                                  {' '}
+                                  <Badge color="success" title={item.quality_reason || ''}>
+                                    good
+                                  </Badge>
+                                </>
+                              )}
+                              {item.quality_status === 'bad' && (
+                                <>
+                                  {' '}
+                                  <Badge color="warning" title={item.quality_reason || ''}>
+                                    bad quality
+                                  </Badge>
+                                </>
+                              )}
+                              {item.quality_status === 'trash' && (
+                                <>
+                                  {' '}
+                                  <Badge color="error" title={item.quality_reason || ''}>
+                                    trash
+                                  </Badge>
+                                </>
+                              )}
+                              {(item.pii_status === 'clean' || item.pii_status === 'masked') && (
+                                <> {' '}<Badge color="success" title={item.pii_status === 'masked' ? 'PII found and masked' : 'No PII detected'}>safe</Badge></>
+                              )}
+                              {item.pii_status === 'masked' && (
+                                <> {' '}<Badge color="warning" title="Original content contains PII — view masked version below">PII masked</Badge></>
+                              )}
                               {item.tags && <> {' '}<Badge color="secondary">{item.tags}</Badge></>}
                               {' · '}{item.content.length.toLocaleString()} chars
                               {item.file_size_bytes && (
@@ -724,8 +929,32 @@ export function DatasetsPage() {
                                 </DetailBox>
                               </div>
                             )}
+                            {item.quality_reason && item.quality_status !== 'unchecked' && (
+                              <div>
+                                <Label>Quality Evaluation ({item.quality_status})</Label>
+                                <DetailBox
+                                  style={{
+                                    color: item.quality_status === 'bad'
+                                      ? tokens.colors.accent.error
+                                      : tokens.colors.text.primary,
+                                  }}
+                                >
+                                  {item.quality_reason}
+                                </DetailBox>
+                              </div>
+                            )}
+                            {item.pii_status === 'masked' && item.pii_masked_content && (
+                              <div>
+                                <Label>Masked Content (PII replaced)</Label>
+                                <DetailBox style={{ borderColor: tokens.colors.accent.warning }}>
+                                  {item.pii_masked_content}
+                                </DetailBox>
+                              </div>
+                            )}
                             <div>
-                              <Label>Content</Label>
+                              <Label>
+                                {item.pii_status === 'masked' ? 'Original Content (contains PII)' : 'Content'}
+                              </Label>
                               <DetailBox>
                                 {item.parse_status === 'pending' && !item.content
                                   ? '(parsing…)'

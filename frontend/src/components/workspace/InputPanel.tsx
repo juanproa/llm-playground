@@ -292,7 +292,14 @@ export function InputPanel({
 
   const pickDatasetItem = (item: InputDatasetItem) => {
     const header = item.name ? `--- ${item.name} ---\n` : '';
-    onInputTextChange(header + item.content);
+    // Once an item has been PII-masked, the masked text is the only version
+    // we feed downstream — mirrors `InputDatasetItem.effective_content` on
+    // the backend.
+    const body =
+      item.pii_status === 'masked' && item.pii_masked_content
+        ? item.pii_masked_content
+        : item.content;
+    onInputTextChange(header + body);
   };
 
   const promptKb = selectedVersion?.kb_id
@@ -508,7 +515,7 @@ export function InputPanel({
         </FormGroup>
       )}
 
-      {selectedVersion && (
+      {selectedVersion && onRagOverrideChange && (
         <FormGroup>
           <Label>RAG for this call</Label>
           <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>

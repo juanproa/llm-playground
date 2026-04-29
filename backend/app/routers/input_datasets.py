@@ -65,6 +65,20 @@ async def create_dataset(data: InputDatasetCreate, db: AsyncSession = Depends(ge
     return ds
 
 
+@router.get("/pii-filter-status")
+async def pii_filter_status():
+    """Return download/load status of the local PII filter model."""
+    from app.services.pii_filter_service import get_status
+    return get_status()
+
+
+@router.post("/pii-filter-preload", response_model=dict)
+async def pii_filter_preload():
+    """Trigger background download + load of the PII filter model."""
+    from app.services.pii_filter_service import preload_async
+    return preload_async()
+
+
 @router.get("/{dataset_id}", response_model=InputDatasetWithItemsResponse)
 async def get_dataset(dataset_id: str, db: AsyncSession = Depends(get_db)):
     ds = await db.get(InputDataset, dataset_id)
@@ -197,6 +211,7 @@ async def upload_pdf(
         tags=tags,
         source_type="pdf",
         source_filename=file.filename,
+        file_path=save_path,
         mime_type=file.content_type or "application/pdf",
         file_size_bytes=len(raw),
         parse_status="pending",
@@ -233,6 +248,7 @@ async def upload_pdfs(
             content="",
             source_type="pdf",
             source_filename=f.filename,
+            file_path=save_path,
             mime_type=f.content_type or "application/pdf",
             file_size_bytes=len(raw),
             parse_status="pending",
@@ -248,6 +264,141 @@ async def upload_pdfs(
         result.append(item)
         background_tasks.add_task(input_dataset_service.parse_pdf_for_item, item.id, save_path)
     return result
+
+
+@router.post("/retry-pending", response_model=dict, status_code=200)
+async def retry_pending_pdfs(
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
+    """Retry all pending PDF parses. Useful if parsing was interrupted (e.g., hibernation)."""
+    result = await db.execute(
+        select(InputDatasetItem)
+        .where(InputDatasetItem.parse_status == "pending")
+        .where(InputDatasetItem.source_type == "pdf")
+    )
+    pending_items = list(result.scalars().all())
+
+    # For items without file_path (old uploads), search uploads dir for matching PDFs
+    os.makedirs(settings.UPLOADS_DIR, exist_ok=True)
+    available_files = {f for f in os.listdir(settings.UPLOADS_DIR) if f.endswith('.pdf')}
+
+    retried = []
+    for item in pending_items:
+        file_path = item.file_path
+
+        # If file_path is missing, try to find the file in uploads by looking for files with matching source_filename
+        if not file_path:
+            if item.source_filename:
+                # Try exact match first, then prefix match
+                matching = [f for f in available_files if item.source_filename in f or f.endswith(item.source_filename.split('.')[-1])]
+                if matching:
+                    file_path = os.path.join(settings.UPLOADS_DIR, matching[0])
+
+        if file_path and os.path.exists(file_path):
+            background_tasks.add_task(input_dataset_service.parse_pdf_for_item, item.id, file_path)
+            retried.append(item)
+        elif not file_path:
+            logger.warning(f"Cannot find file for pending item {item.id} ({item.source_filename})")
+
+    return {
+        "retried_count": len(retried),
+        "items": [InputDatasetItemResponse.model_validate(item) for item in retried],
+    }
+
+
+@router.post("/{dataset_id}/evaluate-quality", response_model=dict, status_code=202)
+async def evaluate_quality(
+    dataset_id: str,
+    background_tasks: BackgroundTasks,
+    model_config_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Kick off LLM-based quality evaluation for all ready items in this dataset."""
+    ds = await db.get(InputDataset, dataset_id)
+    if not ds:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+
+    if ds.eval_status == "running":
+        raise HTTPException(status_code=409, detail="Evaluation already running for this dataset")
+
+    pending = await db.execute(
+        select(InputDatasetItem)
+        .where(InputDatasetItem.dataset_id == dataset_id)
+        .where(InputDatasetItem.parse_status == "pending")
+    )
+    if pending.scalars().first() is not None:
+        raise HTTPException(status_code=409, detail="Wait for all PDFs to finish parsing before evaluating")
+
+    ready = await db.execute(
+        select(InputDatasetItem)
+        .where(InputDatasetItem.dataset_id == dataset_id)
+        .where(InputDatasetItem.parse_status == "ready")
+    )
+    ready_items = list(ready.scalars().all())
+    ready_count = len(ready_items)
+
+    if ready_count == 0:
+        return {"queued_count": 0, "message": "No ready items to evaluate"}
+
+    # Reset every ready item so progress counts from 0/N and re-runs use the
+    # latest prompt/model. Click = always re-evaluate everything.
+    for item in ready_items:
+        item.quality_status = "unchecked"
+        item.quality_reason = None
+    ds.eval_status = "running"
+    await db.commit()
+
+    background_tasks.add_task(input_dataset_service.evaluate_quality_for_dataset, dataset_id, model_config_id)
+    return {"queued_count": ready_count, "message": f"Quality evaluation queued for {ready_count} items"}
+
+
+@router.post("/{dataset_id}/mask-pii", response_model=dict, status_code=202)
+async def mask_pii(
+    dataset_id: str,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
+    """Kick off PII detection and masking for all ready items using the local privacy-filter model."""
+    from app.services.pii_filter_service import is_loaded
+
+    ds = await db.get(InputDataset, dataset_id)
+    if not ds:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+
+    if not is_loaded():
+        raise HTTPException(status_code=409, detail="PII filter model is not loaded. Preload it first.")
+
+    if ds.mask_status == "running":
+        raise HTTPException(status_code=409, detail="PII masking already running for this dataset")
+
+    pending = await db.execute(
+        select(InputDatasetItem)
+        .where(InputDatasetItem.dataset_id == dataset_id)
+        .where(InputDatasetItem.parse_status == "pending")
+    )
+    if pending.scalars().first() is not None:
+        raise HTTPException(status_code=409, detail="Wait for all PDFs to finish parsing before masking PII")
+
+    ready = await db.execute(
+        select(InputDatasetItem)
+        .where(InputDatasetItem.dataset_id == dataset_id)
+        .where(InputDatasetItem.parse_status == "ready")
+    )
+    ready_items = list(ready.scalars().all())
+    ready_count = len(ready_items)
+
+    if ready_count == 0:
+        return {"queued_count": 0, "message": "No ready items to process"}
+
+    for item in ready_items:
+        item.pii_status = "unchecked"
+        item.pii_masked_content = None
+    ds.mask_status = "running"
+    await db.commit()
+
+    background_tasks.add_task(input_dataset_service.mask_pii_for_dataset, dataset_id)
+    return {"queued_count": ready_count, "message": f"PII masking queued for {ready_count} items"}
 
 
 # ─── CSV upload ──────────────────────────────────────────────────────────────

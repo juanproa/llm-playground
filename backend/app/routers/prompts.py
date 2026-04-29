@@ -63,3 +63,13 @@ async def update_version(version_id: str, data: PromptVersionUpdate, db: AsyncSe
     if not version:
         raise HTTPException(status_code=404, detail="Prompt version not found")
     return version
+
+
+@router.delete("/prompt-versions/{version_id}", status_code=204)
+async def delete_version(version_id: str, db: AsyncSession = Depends(get_db)):
+    try:
+        deleted = await prompt_service.delete_version(db, version_id)
+    except prompt_service.PromptVersionDeleteError as exc:
+        raise HTTPException(status_code=400, detail=exc.message)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Prompt version not found")

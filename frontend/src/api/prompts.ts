@@ -26,4 +26,6 @@ export const promptsApi = {
     },
   ) =>
     apiFetch<PromptVersion>(`/prompt-versions/${versionId}`, { method: 'PUT', body: JSON.stringify(data) }),
+  deleteVersion: (versionId: string) =>
+    apiFetch<void>(`/prompt-versions/${versionId}`, { method: 'DELETE' }),
 };

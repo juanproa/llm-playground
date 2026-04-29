@@ -9,6 +9,7 @@ interface PromptStore {
   createPrompt: (projectId: string, data: { name: string; content: string; system_message?: string }) => Promise<Prompt>;
   deletePrompt: (id: string) => Promise<void>;
   createVersion: (promptId: string, data: { content: string; system_message?: string; label?: string }) => Promise<PromptVersion>;
+  deleteVersion: (promptId: string, versionId: string) => Promise<Prompt>;
   setActiveVersion: (versionId: string) => Promise<void>;
 }
 
@@ -44,6 +45,15 @@ export const usePromptStore = create<PromptStore>((set) => ({
       prompts: state.prompts.map((p) => (p.id === promptId ? updated : p)),
     }));
     return version;
+  },
+
+  deleteVersion: async (promptId, versionId) => {
+    await promptsApi.deleteVersion(versionId);
+    const updated = await promptsApi.get(promptId);
+    set((state) => ({
+      prompts: state.prompts.map((p) => (p.id === promptId ? updated : p)),
+    }));
+    return updated;
   },
 
   setActiveVersion: async (versionId) => {

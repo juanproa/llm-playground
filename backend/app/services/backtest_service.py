@@ -20,12 +20,25 @@ from app.models.post_training import BacktestResult, BacktestRun, InferenceCache
 from app.models.prompt import PromptVersion
 from app.providers.registry import get_provider
 from app.services import assertion_engine
+from app.services.inference_service import _final_cleanup
 from app.services.model_config_service import decrypt_api_key
 
 logger = logging.getLogger(__name__)
 
 MAX_CONCURRENT = 5
 DEFAULT_MAX_TOKENS = 4096
+
+
+def _strip_think(text: str | None) -> str:
+    """Reasoning models (Qwen3, DeepSeek-R1, MedGemma, etc.) emit <think>…</think>
+    blocks of private chain-of-thought before the real answer. Strip at storage
+    so every consumer (Batch Compare, dataset add, downstream eval) sees the
+    clean answer without per-page filtering. Reuses inference_service's canonical
+    cleanup so the same model-variant rules (<unusedN>, <reasoning>, …) apply.
+    """
+    if not text:
+        return ""
+    return _final_cleanup(text)
 
 # Serializes all DB writes coming out of concurrent run_single coroutines.
 # aiosqlite's threading model + SQLAlchemy async sessions don't always honor
@@ -197,15 +210,23 @@ async def _score_with_judge(
         actual=actual[:4000],
     )
 
+    # Pass the judge's adapter through so a fine-tuned mlx judge actually runs
+    # its adapter — was silently dropped before, scoring with the base model.
+    judge_extra = dict(judge_model.extra_params or {})
+    if judge_model.adapter_path:
+        judge_extra.setdefault("adapter_path", judge_model.adapter_path)
+
     try:
         response = await provider.generate(
             messages=[{"role": "user", "content": prompt}],
             model_id=judge_model.model_id,
             max_tokens=400,
             temperature=0.0,  # deterministic grading
-            **(judge_model.extra_params or {}),
+            **judge_extra,
         )
-        raw = response.content.strip()
+        # Reasoning judges may emit <think>…</think> before the JSON. Strip it
+        # so the markdown-fence + JSON regexes below can find the real answer.
+        raw = _strip_think(response.content)
         # Strip markdown fences if any
         raw = re.sub(r"^```json\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
         # Find the JSON object in the response
@@ -236,10 +257,28 @@ async def run_backtest(backtest_run_id: str, db: AsyncSession | None = None) -> 
         await _execute_backtest(session, backtest_run_id)
 
 
+async def _is_run_cancelling(run_id: str) -> bool:
+    """Quick read-only check: did someone flip this run to 'cancelling'/'cancelled'?
+
+    Each concurrent run_single coroutine peeks this between read and inference
+    to short-circuit. Uses its own session so it doesn't fight the write lock.
+    """
+    async with async_session() as peek_db:
+        row = await peek_db.get(BacktestRun, run_id)
+        return bool(row and row.status in ("cancelling", "cancelled"))
+
+
 async def _execute_backtest(db: AsyncSession, backtest_run_id: str) -> None:
     run = await db.get(BacktestRun, backtest_run_id)
     if not run:
         logger.error("BacktestRun %s not found", backtest_run_id)
+        return
+
+    # If the run was cancelled before it ever started, finalize and bail.
+    if run.status in ("cancelling", "cancelled"):
+        run.status = "cancelled"
+        run.completed_at = datetime.now(timezone.utc)
+        await db.commit()
         return
 
     # Mark as running
@@ -305,6 +344,11 @@ async def _execute_backtest(db: AsyncSession, backtest_run_id: str) -> None:
             "provider": model_config.provider,
             "model_id": model_config.model_id,
             "temperature": model_config.temperature,
+            # Honor the model's configured cap. Treat 0 as "not set" → fall back
+            # to DEFAULT_MAX_TOKENS so legacy configs don't break, but anything
+            # >0 wins. The previous hardcoded 4096 made local models like
+            # Qwen 8B (4-bit) ramble for minutes per case.
+            "max_tokens": model_config.max_tokens if (model_config.max_tokens or 0) > 0 else DEFAULT_MAX_TOKENS,
             "extra_params": dict(model_config.extra_params or {}),
             "adapter_path": model_config.adapter_path,
             "api_key_encrypted": model_config.api_key_encrypted,
@@ -323,6 +367,10 @@ async def _execute_backtest(db: AsyncSession, backtest_run_id: str) -> None:
                 "api_key_encrypted": judge_model.api_key_encrypted,
                 "base_url": judge_model.base_url,
                 "extra_params": dict(judge_model.extra_params or {}),
+                # Pass adapter_path through so a fine-tuned mlx judge actually
+                # runs its adapter (assertion_engine reads this off judge_model
+                # to build its provider call).
+                "adapter_path": judge_model.adapter_path,
             }
         result_ids = [r.id for r in result_list]
 
@@ -331,27 +379,41 @@ async def _execute_backtest(db: AsyncSession, backtest_run_id: str) -> None:
         async def run_single(result_id: str) -> dict:
             """Inference under the semaphore; DB write serialized by _DB_WRITE_LOCK."""
             async with semaphore:
-                try:
-                    outcome = await _run_single_case(
-                        result_id,
-                        run_snapshot,
-                        prompt_snapshot,
-                        model_cfg_snapshot,
-                        judge_snapshot,
-                        pass_threshold,
-                    )
-                except Exception as e:
-                    logger.exception("run_single crashed for result %s", result_id)
+                # Skip the (potentially slow) inference if the user hit Stop
+                # while earlier cases were still in flight.
+                if await _is_run_cancelling(backtest_run_id):
                     outcome = {
                         "result_id": result_id,
-                        "status": "error",
-                        "error_message": f"run_single crashed: {e}"[:500],
+                        "status": "cancelled",
+                        "error_message": None,
                         "pass_score": None,
                         "assertion_results_json": None,
                         "actual_output": None,
                         "latency_ms": 0,
                         "cache_hit": False,
                     }
+                else:
+                    try:
+                        outcome = await _run_single_case(
+                            result_id,
+                            run_snapshot,
+                            prompt_snapshot,
+                            model_cfg_snapshot,
+                            judge_snapshot,
+                            pass_threshold,
+                        )
+                    except Exception as e:
+                        logger.exception("run_single crashed for result %s", result_id)
+                        outcome = {
+                            "result_id": result_id,
+                            "status": "error",
+                            "error_message": f"run_single crashed: {e}"[:500],
+                            "pass_score": None,
+                            "assertion_results_json": None,
+                            "actual_output": None,
+                            "latency_ms": 0,
+                            "cache_hit": False,
+                        }
 
             # Serialized write-back — only one session commits at a time across
             # all concurrent run_single coroutines.
@@ -390,7 +452,9 @@ async def _execute_backtest(db: AsyncSession, backtest_run_id: str) -> None:
         run.failed_cases = failed
         run.total_cases = total
         run.pass_rate = (passed / scored) if scored > 0 else None
-        run.status = "completed"
+        # Honor cancellation: if Stop was hit mid-run, finalize as 'cancelled'
+        # rather than 'completed'. Partial outputs are preserved.
+        run.status = "cancelled" if run.status in ("cancelling", "cancelled") else "completed"
         run.completed_at = datetime.now(timezone.utc)
         await db.commit()
         no_judge = total - scored
@@ -492,6 +556,7 @@ async def _run_single_case(
     status = "pending"
 
     try:
+        max_tokens = model_snap["max_tokens"]
         # ── Try inference cache (read-only, short session) ──
         async with _DB_WRITE_LOCK:
             async with async_session() as cache_db:
@@ -501,11 +566,13 @@ async def _run_single_case(
                     model_config_id=run_snap["model_config_id"],
                     test_case_id=tc_id,
                     document_id=tc_document_id,
-                    max_tokens=DEFAULT_MAX_TOKENS,
+                    max_tokens=max_tokens,
                     temperature=model_snap["temperature"],
                 )
                 if cached is not None:
-                    actual = cached.output
+                    # Strip again on read — old cached outputs may have been
+                    # stored before the at-storage strip was added.
+                    actual = _strip_think(cached.output)
                     elapsed_ms = cached.latency_ms or 0
                     cache_hit = True
 
@@ -514,12 +581,12 @@ async def _run_single_case(
             response = await provider.generate(
                 messages=messages,
                 model_id=model_snap["model_id"],
-                max_tokens=DEFAULT_MAX_TOKENS,
+                max_tokens=max_tokens,
                 temperature=model_snap["temperature"],
                 **extra_params,
             )
             elapsed_ms = int((time.monotonic() - start) * 1000)
-            actual = response.content
+            actual = _strip_think(response.content)
 
             # Store to cache (write under lock)
             async with _DB_WRITE_LOCK:
@@ -530,7 +597,7 @@ async def _run_single_case(
                         model_config_id=run_snap["model_config_id"],
                         test_case_id=tc_id,
                         document_id=tc_document_id,
-                        max_tokens=DEFAULT_MAX_TOKENS,
+                        max_tokens=max_tokens,
                         temperature=model_snap["temperature"],
                         output=actual,
                         latency_ms=elapsed_ms,

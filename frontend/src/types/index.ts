@@ -184,6 +184,10 @@ export interface TestCase {
   notes: string | null;
   is_golden: boolean;
   document_id: string | null;
+  source_kb_item_id?: string | null;
+  // Back-link to the InputDataset item (global "Datasets" sidebar / `input_datasets`),
+  // NOT to a post-training SFT dataset item. See CLAUDE.md "Data entities".
+  source_input_dataset_item_id?: string | null;
   assertions: string | null;          // raw JSON string; parse with JSON.parse
   pass_threshold: number | null;
   created_at: string;
@@ -224,14 +228,14 @@ export interface BacktestResult {
   test_case?: TestCase;
 }
 
+// Batch Compare (hard-split from Backtest). Owns its own tables —
+// pt_comparison_runs / _children / _results / _input_items — and never
+// writes into pt_backtest_runs / pt_test_cases.
 export interface ComparisonRun {
   id: string;
   project_id: string;
   name: string;
   prompt_version_id: string;
-  model_config_ids: string;             // JSON string
-  test_case_ids: string | null;
-  child_backtest_run_ids: string | null;
   judge_model_config_id: string | null;
   status: string;
   error_message: string | null;
@@ -240,8 +244,50 @@ export interface ComparisonRun {
   created_at: string;
 }
 
+export interface ComparisonInputItem {
+  id: string;
+  comparison_run_id: string;
+  input_text: string;
+  // Display label, copied from InputDatasetItem.name at create time. Null
+  // for ad-hoc rows or when the source item had no name.
+  name: string | null;
+  source_input_dataset_item_id?: string | null;
+  ordering: number;
+  created_at: string;
+}
+
+export interface ComparisonResult {
+  id: string;
+  child_id: string;
+  input_item_id: string;
+  actual_output: string | null;
+  status: string;            // pending | completed | failed | no_judgment | cancelled
+  pass_score: number | null;
+  latency_ms: number | null;
+  cache_hit?: boolean;
+  error_message: string | null;
+  created_at: string;
+}
+
+export interface ComparisonChild {
+  id: string;
+  comparison_run_id: string;
+  kind: 'model' | 'chain';
+  model_config_id: string | null;
+  prompt_version_id: string | null;
+  chain_id: string | null;
+  status: string;
+  error_message: string | null;
+  ordering: number;
+  started_at: string | null;
+  completed_at: string | null;
+  created_at: string;
+  results: ComparisonResult[];
+}
+
 export interface ComparisonRunWithChildren extends ComparisonRun {
-  children: (BacktestRun & { results: BacktestResult[] })[];
+  input_items: ComparisonInputItem[];
+  children: ComparisonChild[];
 }
 
 // ─── Post-training extras ─────────────────────────────────────────────────────
@@ -381,6 +427,8 @@ export interface InputDataset {
   name: string;
   description: string | null;
   item_count: number;
+  eval_status: string;
+  mask_status: string;
   created_at: string;
   updated_at: string;
 }
@@ -398,11 +446,23 @@ export interface InputDatasetItem {
   file_size_bytes: number | null;
   parse_status: string;
   parse_error: string | null;
+  quality_status: string;
+  quality_reason: string | null;
+  pii_status: string;
+  pii_masked_content: string | null;
   created_at: string;
 }
 
 export interface InputDatasetWithItems extends InputDataset {
   items: InputDatasetItem[];
+}
+
+export interface PiiModelStatus {
+  model_id: string;
+  loaded: boolean;
+  downloaded: boolean;
+  preload_state: 'running' | 'done' | 'error' | null;
+  preload_error: string | null;
 }
 
 // ─── Chat ────────────────────────────────────────────────────────────────────
@@ -430,4 +490,113 @@ export interface ChatMessage {
 
 export interface ChatSessionWithMessages extends ChatSession {
   messages: ChatMessage[];
+}
+
+// ─── Model Chain (DAG) ──────────────────────────────────────────────────────
+
+export interface EdgeAssertion {
+  op: 'contains' | 'equals' | 'regex' | 'startswith' | 'endswith';
+  value: string;
+  case_sensitive?: boolean;
+  negate?: boolean;
+}
+
+export interface ChainNode {
+  id: string;
+  chain_id: string;
+  name: string;
+  position_x: number;
+  position_y: number;
+  prompt_version_id: string | null;
+  model_config_id: string | null;
+  kb_id: string | null;
+  kb_top_k: number | null;
+  kb_query_template: string | null;
+  input_text: string | null;
+  input_document_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ChainEdge {
+  id: string;
+  chain_id: string;
+  source_node_id: string;
+  target_node_id: string;
+  assertion: EdgeAssertion | null;
+  created_at: string;
+}
+
+export interface Chain {
+  id: string;
+  project_id: string;
+  name: string;
+  description: string | null;
+  created_at: string;
+  updated_at: string;
+  nodes: ChainNode[];
+  edges: ChainEdge[];
+}
+
+export interface ChainListItem {
+  id: string;
+  project_id: string;
+  name: string;
+  description: string | null;
+  created_at: string;
+  updated_at: string;
+  node_count: number;
+  edge_count: number;
+}
+
+export type ChainRunStatus =
+  | 'pending'
+  | 'running'
+  | 'completed'
+  | 'failed'
+  // Cancellation flow: user requests stop → backend flips to 'cancelling' →
+  // executor finalizes between nodes as 'cancelled' (partial outputs preserved).
+  | 'cancelling'
+  | 'cancelled';
+export type ChainNodeRunStatus = 'pending' | 'running' | 'completed' | 'skipped' | 'failed';
+
+export interface ChainNodeRun {
+  id: string;
+  run_id: string;
+  node_id: string;
+  status: ChainNodeRunStatus;
+  skip_reason: string | null;
+  resolved_input: string | null;
+  output_text: string | null;
+  error_message: string | null;
+  latency_ms: number | null;
+  inference_run_id: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  created_at: string;
+}
+
+export interface ChainRun {
+  id: string;
+  chain_id: string;
+  status: ChainRunStatus;
+  error_message: string | null;
+  // JSON string: { [node_name]: output_text }. Populated when the run reaches
+  // a terminal state. Treat as the chain's "single result" — Batch Compare
+  // will consume this when chains are runnable as models.
+  final_output: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  created_at: string;
+  node_runs: ChainNodeRun[];
+}
+
+export interface ChainRunListItem {
+  id: string;
+  chain_id: string;
+  status: ChainRunStatus;
+  error_message: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  created_at: string;
 }

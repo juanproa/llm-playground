@@ -13,11 +13,10 @@ from app.models.post_training import FeedbackItem, FeedbackRun
 from app.models.prompt import PromptVersion
 from app.providers.registry import get_provider
 from app.schemas.post_training import FeedbackSubmit
+from app.services.inference_service import _final_cleanup, _resolve_max_tokens
 from app.services.model_config_service import decrypt_api_key
 
 logger = logging.getLogger(__name__)
-
-DEFAULT_MAX_TOKENS = 4096
 
 
 async def generate_outputs_for_run(db: AsyncSession, run_id: str) -> int:
@@ -56,6 +55,13 @@ async def generate_outputs_for_run(db: AsyncSession, run_id: str) -> int:
     api_key = decrypt_api_key(model_config.api_key_encrypted) if model_config.api_key_encrypted else None
     provider = get_provider(model_config.provider, api_key=api_key, base_url=model_config.base_url)
 
+    # Honor adapter_path so fine-tuned mlx models actually run their adapter
+    # (was silently dropping it before — a fine-tune in a Feedback run produced
+    # base-model output indistinguishable from the un-tuned model).
+    extra_params = dict(model_config.extra_params or {})
+    if model_config.adapter_path:
+        extra_params.setdefault("adapter_path", model_config.adapter_path)
+
     processed = 0
     for item in pending_items:
         messages = []
@@ -71,11 +77,13 @@ async def generate_outputs_for_run(db: AsyncSession, run_id: str) -> int:
             response = await provider.generate(
                 messages=messages,
                 model_id=model_config.model_id,
-                max_tokens=DEFAULT_MAX_TOKENS,
+                max_tokens=_resolve_max_tokens(model_config.max_tokens),
                 temperature=model_config.temperature,
-                **(model_config.extra_params or {}),
+                **extra_params,
             )
-            item.model_output = response.content
+            # Clean reasoning artifacts (<think>, <unusedN>, etc.) so feedback
+            # ratings target the actual answer, not the model's CoT.
+            item.model_output = _final_cleanup(response.content)
             item.generation_status = "generated"
         except Exception as e:
             logger.exception("Failed to generate output for item %s: %s", item.id, e)

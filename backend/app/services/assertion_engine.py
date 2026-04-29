@@ -373,15 +373,24 @@ async def _assert_llm_judge(
         actual=_fmt(actual_slice)[:3000],
     )
 
+    # Honor the judge's adapter_path (and any other extra_params). Without this,
+    # a fine-tuned mlx judge silently ran the base model.
+    judge_extra = dict(getattr(judge_model, "extra_params", None) or {})
+    judge_adapter = getattr(judge_model, "adapter_path", None)
+    if judge_adapter:
+        judge_extra.setdefault("adapter_path", judge_adapter)
+
     try:
         resp = await judge_provider.generate(
             messages=[{"role": "user", "content": prompt}],
             model_id=judge_model.model_id,
             max_tokens=300,
             temperature=0.0,
-            **(judge_model.extra_params or {}),
+            **judge_extra,
         )
-        raw = resp.content.strip()
+        # Reasoning judges may emit <think>…</think> before the JSON; strip so
+        # the JSON regex below can find the actual answer.
+        raw = re.sub(r"<(think|thinking|reasoning)>[\s\S]*?</\1>", "", resp.content, flags=re.IGNORECASE).strip()
         raw = re.sub(r"^```json\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
         m = re.search(r"\{[\s\S]*\}", raw)
         if not m:

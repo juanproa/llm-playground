@@ -22,11 +22,10 @@ from app.database import async_session
 from app.models.chat import ChatMessage, ChatSession
 from app.models.model_config import ModelConfig
 from app.providers.registry import get_provider
+from app.services.inference_service import StreamCleaner, _final_cleanup
 from app.services.model_config_service import decrypt_api_key
 
 logger = logging.getLogger(__name__)
-
-DEFAULT_MAX_TOKENS = 4096
 
 
 # ─── CRUD ───────────────────────────────────────────────────────────────────
@@ -197,17 +196,29 @@ async def create_turn_stream(
     async def generate_chunks() -> AsyncIterator[str]:
         # First event: metadata so the frontend knows the message ids
         yield f"data: {json.dumps({'meta': {'user_id': user_msg_id, 'assistant_id': assistant_msg_id}})}\n\n"
+        # StreamCleaner suppresses <think>/<unusedN>/<reasoning> blocks across
+        # chunk boundaries — same approach as the Workspace stream — so chat
+        # history doesn't accumulate the model's chain-of-thought.
+        cleaner = StreamCleaner()
         try:
             async for chunk in provider.stream(
                 messages=messages,
                 model_id=model_config.model_id,
-                max_tokens=model_config.max_tokens or DEFAULT_MAX_TOKENS,
+                # Honor the model's configured cap; treat 0 as "not set" → use
+                # inference_service's same default. Anything >0 wins.
+                max_tokens=model_config.max_tokens if (model_config.max_tokens or 0) > 0 else 4096,
                 temperature=model_config.temperature,
                 **extra_params,
             ):
-                if chunk:
-                    ctx.full_text.append(chunk)
-                    yield f"data: {json.dumps({'text': chunk})}\n\n"
+                cleaned = cleaner.feed(chunk)
+                if cleaned:
+                    ctx.full_text.append(cleaned)
+                    yield f"data: {json.dumps({'text': cleaned})}\n\n"
+            # Flush any tail buffered while waiting on a never-arriving close tag
+            remaining = cleaner.flush()
+            if remaining:
+                ctx.full_text.append(remaining)
+                yield f"data: {json.dumps({'text': remaining})}\n\n"
         except Exception as e:
             ctx.error = str(e)
             logger.exception("Chat stream failed for session %s", session_id)
@@ -219,7 +230,10 @@ async def create_turn_stream(
 async def finalize_turn(ctx: ChatTurnContext) -> None:
     """Persist the assistant message's final text + usage stats after the stream ends."""
     elapsed_ms = int((time.monotonic() - ctx.start_time) * 1000)
-    full_text = "".join(ctx.full_text)
+    # Defense-in-depth: StreamCleaner already suppresses thinking blocks
+    # chunk-by-chunk, but if a model emits something the cleaner doesn't
+    # recognize, _final_cleanup catches it before the row is persisted.
+    full_text = _final_cleanup("".join(ctx.full_text))
     async with async_session() as db:
         row = await db.get(ChatMessage, ctx.assistant_message_id)
         if not row:

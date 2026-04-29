@@ -307,6 +307,12 @@ export const postTrainingApi = {
       method: 'DELETE',
     }),
 
+  bulkDeleteTestCases: (projectId: string, ids: string[]) =>
+    apiFetch<void>(`${base(projectId)}/test-cases/bulk-delete`, {
+      method: 'POST',
+      body: JSON.stringify({ ids }),
+    }),
+
   // Backtest Runs
   listBacktestRuns: (projectId: string) =>
     apiFetch<BacktestRun[]>(`${base(projectId)}/backtest-runs`),
@@ -343,10 +349,21 @@ export const postTrainingApi = {
     projectId: string,
     data: {
       name: string;
-      prompt_version_id: string;
+      // Optional: when omitted, every model_config_id MUST be in `prompt_version_overrides`.
+      prompt_version_id?: string;
       model_config_ids: string[];
-      knowledge_base_item_ids?: string[];
-      test_case_ids?: string[];
+      // Chain columns: each chain runs end-to-end and the cell stores `{node_name: text}`
+      // JSON. Either model_config_ids or chain_ids must be non-empty.
+      chain_ids?: string[];
+      // {model_config_id: prompt_version_id}. Models not present inherit `prompt_version_id`.
+      prompt_version_overrides?: Record<string, string>;
+      // Inputs — pass ONE of these:
+      //   input_dataset_id (+ optional input_dataset_item_ids): pull rows from a global
+      //     InputDataset (sidebar "Datasets" — `input_datasets`, NOT SFT `pt_datasets`).
+      //   input_texts: ad-hoc free-text rows.
+      input_dataset_id?: string;
+      input_dataset_item_ids?: string[];
+      input_texts?: string[];
       judge_model_config_id?: string;
     },
   ) =>
@@ -360,4 +377,9 @@ export const postTrainingApi = {
 
   deleteComparisonRun: (projectId: string, comparisonId: string) =>
     apiFetch<void>(`${base(projectId)}/comparison-runs/${comparisonId}`, { method: 'DELETE' }),
+
+  cancelComparisonRun: (projectId: string, comparisonId: string) =>
+    apiFetch<ComparisonRun>(`${base(projectId)}/comparison-runs/${comparisonId}/cancel`, {
+      method: 'POST',
+    }),
 };

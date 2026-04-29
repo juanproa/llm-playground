@@ -1,9 +1,12 @@
 /**
- * Batch Compare: run the same prompt across N models over M test cases and
- * display the results in a matrix: rows = test cases, columns = models.
+ * Batch Compare: run the same prompt across N models (and/or chains) over M
+ * input rows and display the results in a matrix:
+ *   rows    = ComparisonInputItem (input_text)
+ *   columns = ComparisonChild (kind='model' or 'chain')
+ *   cell    = ComparisonResult
  *
- * Each cell shows the aggregate score bar; expanding a cell reveals per-assertion
- * results.  Column headers show per-model pass rate and mean score.
+ * Lives on its own tables (pt_comparison_runs / _children / _results /
+ * _input_items) — does not touch BacktestRun / TestCase.
  */
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useParams } from 'react-router-dom';
@@ -14,20 +17,21 @@ import { WorkspaceSubNav } from '../components/workspace/WorkspaceSubNav';
 import { Button } from '../components/common/Button';
 import { Badge } from '../components/common/Badge';
 import { postTrainingApi } from '../api/postTraining';
-import { knowledgeBaseApi } from '../api/knowledgeBase';
+import { inputDatasetsApi } from '../api/inputDatasets';
+import { chainsApi } from '../api/chains';
 import { useProjectStore } from '../stores/projectStore';
 import { usePromptStore } from '../stores/promptStore';
 import { useModelStore } from '../stores/modelStore';
 import type {
-  AssertionResult,
-  BacktestResult,
-  BacktestRun,
+  ChainListItem,
+  ComparisonChild,
+  ComparisonInputItem,
+  ComparisonResult,
   ComparisonRun,
   ComparisonRunWithChildren,
   Dataset,
-  KnowledgeBase,
-  KnowledgeBaseItem,
-  TestCase,
+  InputDataset,
+  InputDatasetItem,
 } from '../types';
 
 /* ─── Layout ─────────────────────────────────────────────────────────────── */
@@ -259,28 +263,11 @@ const Th = styled.th`
   z-index: 1;
 `;
 
-const Td = styled.td<{ $pass?: boolean; $fail?: boolean }>`
+const Td = styled.td<{ $fail?: boolean }>`
   padding: 10px 12px;
   border-bottom: 1px solid ${tokens.colors.border.subtle};
   vertical-align: top;
-  background: ${({ $pass, $fail }) =>
-    $pass ? 'rgba(0, 230, 118, 0.04)'
-    : $fail ? 'rgba(255, 82, 82, 0.04)'
-    : 'transparent'};
-`;
-
-const ScoreBar = styled.div<{ $score: number }>`
-  height: 6px;
-  border-radius: 100px;
-  background: linear-gradient(
-    to right,
-    ${({ $score }) =>
-      $score >= 0.8 ? tokens.colors.accent.success
-      : $score >= 0.5 ? tokens.colors.accent.warning
-      : tokens.colors.accent.error
-    } ${({ $score }) => `${Math.round($score * 100)}%`},
-    ${tokens.colors.bg.tertiary} ${({ $score }) => `${Math.round($score * 100)}%`}
-  );
+  background: ${({ $fail }) => $fail ? 'rgba(255, 82, 82, 0.04)' : 'transparent'};
 `;
 
 const FilterBar = styled.div`
@@ -297,16 +284,58 @@ const FilterBar = styled.div`
 
 /* ─── Helpers ────────────────────────────────────────────────────────────── */
 
-function parseJson<T>(raw: string | null | undefined, fallback: T): T {
-  if (!raw) return fallback;
-  try { return JSON.parse(raw) as T; } catch { return fallback; }
+// Reasoning models (Qwen3, DeepSeek-R1, etc.) emit <think>…</think> blocks
+// containing private chain-of-thought before the real answer. The user-facing
+// answer is everything outside those tags; the inside is debugging noise.
+// Strip well-formed pairs only — leave malformed/truncated content visible so
+// "stream got cut mid-think" stays a noticeable signal in the UI.
+function stripThinkTags(s: string | null | undefined): string {
+  if (!s) return '';
+  return s.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
 }
 
-function scoreColorVariant(score: number | null): 'success' | 'warning' | 'error' | 'secondary' {
-  if (score === null) return 'secondary';
-  if (score >= 0.8) return 'success';
-  if (score >= 0.5) return 'warning';
-  return 'error';
+// Deep-parse: for each leaf string value, try parsing it as JSON. Mirrors the
+// helper on ModelChainPage — chain comparison cells store the chain's
+// `final_output` ({node_name: text}) verbatim, where each value is itself a
+// JSON string. Rendering it nested is much more readable than a blob of
+// escaped quotes. Strips ```json fences before parsing.
+function deepParseChain(value: unknown): unknown {
+  if (typeof value !== 'string') return value;
+  const trimmed = value.trim();
+  if (!trimmed) return value;
+  const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/);
+  const candidate = fenced ? fenced[1] : trimmed;
+  if (!/^[\[{]/.test(candidate)) return value;
+  try {
+    return deepParseAllChain(JSON.parse(candidate));
+  } catch {
+    return value;
+  }
+}
+
+function deepParseAllChain(node: unknown): unknown {
+  if (Array.isArray(node)) return node.map(deepParseAllChain);
+  if (node && typeof node === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(node)) out[k] = deepParseAllChain(v);
+    return out;
+  }
+  return deepParseChain(node);
+}
+
+function prettyChainOutput(raw: string | null | undefined): string {
+  if (!raw) return '';
+  try {
+    return JSON.stringify(deepParseAllChain(JSON.parse(raw)), null, 2);
+  } catch {
+    return raw;
+  }
+}
+
+function inputPreview(text: string, max = 80): string {
+  const t = (text ?? '').replace(/\s+/g, ' ').trim();
+  if (!t) return '(empty)';
+  return t.length > max ? `${t.slice(0, max)}…` : t;
 }
 
 /* ─── Page ───────────────────────────────────────────────────────────────── */
@@ -322,9 +351,7 @@ export function BatchComparePage() {
   const [detail, setDetail] = useState<ComparisonRunWithChildren | null>(null);
   const [showModal, setShowModal] = useState(false);
   const [expandedCellKey, setExpandedCellKey] = useState<string | null>(null);
-  const [showOnlyDisagree, setShowOnlyDisagree] = useState(false);
   const [showOnlyFailures, setShowOnlyFailures] = useState(false);
-  const [activeAssertion, setActiveAssertion] = useState<string>('');
 
   // Add-to-dataset state
   const [addTarget, setAddTarget] = useState<AddToDatasetTarget | null>(null);
@@ -334,43 +361,63 @@ export function BatchComparePage() {
   const [savingToDataset, setSavingToDataset] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState(false);
 
+  // Chains available as columns. A chain runs as a single canonical column —
+  // the chain's full `final_output` JSON ({node_name: text}) is the cell value.
+  // Chains carry their own prompts and per-node models, so prompt overrides /
+  // judge models do not apply.
+  const [chains, setChains] = useState<ChainListItem[]>([]);
+  const [selectedChainIds, setSelectedChainIds] = useState<Set<string>>(new Set());
+
   // New-comparison form
   const [name, setName] = useState('');
   const [promptVersionId, setPromptVersionId] = useState('');
   const [selectedModelIds, setSelectedModelIds] = useState<Set<string>>(new Set());
+  // Optional per-model prompt override: key = model_config_id, value = prompt_version_id.
+  // Models not present here inherit the form's `promptVersionId`. Useful for comparing
+  // a small (3B) model's tuned prompt against a frontier model's tighter prompt.
+  const [promptOverrides, setPromptOverrides] = useState<Record<string, string>>({});
   const [judgeModelId, setJudgeModelId] = useState('');
 
-  // Knowledge Base picker state
-  const [kbs, setKbs] = useState<KnowledgeBase[]>([]);
-  const [selectedKbId, setSelectedKbId] = useState<string>('');
-  const [kbItems, setKbItems] = useState<KnowledgeBaseItem[]>([]);
-  const [selectedKbItemIds, setSelectedKbItemIds] = useState<Set<string>>(new Set());
-  const [loadingKbItems, setLoadingKbItems] = useState(false);
+  // Input Dataset picker state — Batch Compare pulls inputs from a global
+  // InputDataset (sidebar "Datasets" / `input_datasets`). NOT the post-training
+  // SFT `pt_datasets`. See CLAUDE.md "Data entities".
+  const [inputDatasets, setInputDatasets] = useState<InputDataset[]>([]);
+  const [inputDatasetId, setInputDatasetId] = useState<string>('');
+  const [datasetItems, setDatasetItems] = useState<InputDatasetItem[]>([]);
+  const [selectedItemIds, setSelectedItemIds] = useState<Set<string>>(new Set());
+  const [loadingDatasetItems, setLoadingDatasetItems] = useState(false);
 
   useEffect(() => {
     if (!projectId) return;
     fetchProject(projectId);
     fetchPrompts(projectId);
     fetchModels();
-    knowledgeBaseApi.list().then(setKbs).catch(() => setKbs([]));
+    inputDatasetsApi.list().then(setInputDatasets).catch(() => setInputDatasets([]));
+    chainsApi.list(projectId).then(setChains).catch(() => setChains([]));
     void loadRuns();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectId]);
 
-  // Fetch items when the selected KB changes
+  // Fetch items when the selected dataset changes; default-select all so the
+  // common case ("use the whole dataset") still requires zero clicks.
   useEffect(() => {
-    if (!selectedKbId) {
-      setKbItems([]);
-      setSelectedKbItemIds(new Set());
+    if (!inputDatasetId) {
+      setDatasetItems([]);
+      setSelectedItemIds(new Set());
       return;
     }
-    setLoadingKbItems(true);
-    knowledgeBaseApi.listItems(selectedKbId)
-      .then(setKbItems)
-      .catch(() => setKbItems([]))
-      .finally(() => setLoadingKbItems(false));
-    setSelectedKbItemIds(new Set());
-  }, [selectedKbId]);
+    setLoadingDatasetItems(true);
+    inputDatasetsApi.listItems(inputDatasetId)
+      .then((items) => {
+        setDatasetItems(items);
+        setSelectedItemIds(new Set(items.map((it) => it.id)));
+      })
+      .catch(() => {
+        setDatasetItems([]);
+        setSelectedItemIds(new Set());
+      })
+      .finally(() => setLoadingDatasetItems(false));
+  }, [inputDatasetId]);
 
   const loadRuns = useCallback(async () => {
     if (!projectId) return;
@@ -391,7 +438,7 @@ export function BatchComparePage() {
       try {
         const d = await postTrainingApi.getComparisonRun(projectId, selectedId);
         setDetail(d);
-        if (d.status === 'running' || d.status === 'pending') {
+        if (d.status === 'running' || d.status === 'pending' || d.status === 'cancelling') {
           timer = setTimeout(fetchDetail, 3000);
         } else {
           // Also refresh the run list to update statuses
@@ -417,17 +464,47 @@ export function BatchComparePage() {
   );
 
   async function handleCreate() {
-    if (!projectId || !name.trim() || !promptVersionId || selectedModelIds.size < 2) return;
-    if (selectedKbItemIds.size === 0) {
-      alert('Pick at least one KB item to use as input for the comparison.');
+    if (!projectId || !name.trim()) return;
+    if (selectedModelIds.size < 1 && selectedChainIds.size < 1) {
+      alert('Pick at least one model or chain to compare.');
+      return;
+    }
+    if (!inputDatasetId) {
+      alert('Pick a dataset to use as input for the comparison.');
+      return;
+    }
+    if (selectedItemIds.size === 0) {
+      alert('Pick at least one item from the dataset.');
+      return;
+    }
+    // Drop overrides for models that are no longer selected (the user may have
+    // toggled them off after picking an override).
+    const cleanOverrides: Record<string, string> = {};
+    for (const [mid, pv] of Object.entries(promptOverrides)) {
+      if (selectedModelIds.has(mid) && pv && pv !== promptVersionId) cleanOverrides[mid] = pv;
+    }
+    // Main prompt is optional iff every selected model has an override.
+    // Chains carry their own prompts, so they don't factor into this check.
+    const everyModelHasOverride = selectedModelIds.size > 0
+      && Array.from(selectedModelIds).every((mid) => !!cleanOverrides[mid]);
+    if (selectedModelIds.size > 0 && !promptVersionId && !everyModelHasOverride) {
+      alert('Pick a default prompt, or set an override for each selected model.');
       return;
     }
     try {
+      // If user only picked some items, send the subset; otherwise omit so the
+      // backend just ingests the whole dataset.
+      const itemIds = selectedItemIds.size === datasetItems.length
+        ? undefined
+        : Array.from(selectedItemIds);
       const created = await postTrainingApi.createComparisonRun(projectId, {
         name: name.trim(),
-        prompt_version_id: promptVersionId,
+        prompt_version_id: promptVersionId || undefined,
         model_config_ids: Array.from(selectedModelIds),
-        knowledge_base_item_ids: Array.from(selectedKbItemIds),
+        chain_ids: selectedChainIds.size > 0 ? Array.from(selectedChainIds) : undefined,
+        prompt_version_overrides: Object.keys(cleanOverrides).length ? cleanOverrides : undefined,
+        input_dataset_id: inputDatasetId,
+        input_dataset_item_ids: itemIds,
         judge_model_config_id: judgeModelId || undefined,
       });
       setRuns((prev) => [created, ...prev]);
@@ -435,8 +512,11 @@ export function BatchComparePage() {
       setShowModal(false);
       setName('');
       setSelectedModelIds(new Set());
-      setSelectedKbId('');
-      setSelectedKbItemIds(new Set());
+      setSelectedChainIds(new Set());
+      setPromptOverrides({});
+      setInputDatasetId('');
+      setDatasetItems([]);
+      setSelectedItemIds(new Set());
     } catch (e) {
       alert((e as Error).message);
     }
@@ -449,6 +529,17 @@ export function BatchComparePage() {
       await postTrainingApi.deleteComparisonRun(projectId, id);
       if (selectedId === id) setSelectedId(null);
       await loadRuns();
+    } catch (e) {
+      alert((e as Error).message);
+    }
+  }
+
+  async function handleStop() {
+    if (!projectId || !selectedId) return;
+    try {
+      const updated = await postTrainingApi.cancelComparisonRun(projectId, selectedId);
+      setDetail((prev) => (prev ? { ...prev, status: updated.status } : prev));
+      setRuns((prev) => prev.map((r) => (r.id === updated.id ? { ...r, status: updated.status } : r)));
     } catch (e) {
       alert((e as Error).message);
     }
@@ -482,9 +573,11 @@ export function BatchComparePage() {
         setSelectedDatasetId(created.id);
       }
       await postTrainingApi.addDatasetItems(projectId, datasetId, [{
-        input_text: addTarget.testCase.input_text,
-        output_text: addTarget.cell.result.actual_output ?? '',
-        instruction: addTarget.testCase.name,
+        input_text: addTarget.inputItem.input_text,
+        // Strip <think>…</think> reasoning before persisting — we don't want to
+        // train on a model's private chain-of-thought.
+        output_text: stripThinkTags(addTarget.cell.result.actual_output),
+        instruction: inputPreview(addTarget.inputItem.input_text, 60),
         tags: `batch_compare,model:${addTarget.modelName}`,
       }]);
       setSaveSuccess(true);
@@ -495,66 +588,63 @@ export function BatchComparePage() {
   }
 
   // Build the matrix data from detail
-  const matrix = useMemo(() => buildMatrix(detail, models), [detail, models]);
+  const matrix = useMemo(() => buildMatrix(detail), [detail]);
 
-  // Discover distinct assertion names (for the filter)
-  const assertionNames = useMemo(() => {
-    const names = new Set<string>();
-    matrix.rows.forEach((row) => {
-      row.cells.forEach((cell) => {
-        if (!cell) return;
-        const parsed = parseJson<AssertionResult[]>(cell.result.assertion_results || null, []);
-        parsed.forEach((ar) => names.add(ar.name));
-      });
-    });
-    return Array.from(names).sort();
-  }, [matrix]);
+  // Lookup helper: a column-level label for the prompt actually used by this child run.
+  // Lets the header surface "custom prompt" badges for models running an override.
+  const promptVersionLabel = useCallback((vid: string | null | undefined): string | null => {
+    if (!vid) return null;
+    for (const p of prompts) {
+      const v = p.versions.find((vv) => vv.id === vid);
+      if (v) return `${p.name} v${v.version_number}${v.label ? ` (${v.label})` : ''}`;
+    }
+    return vid.slice(0, 8);
+  }, [prompts]);
 
   // Apply filters to rows
   const filteredRows = useMemo(() => {
-    return matrix.rows.filter((row) => {
-      const validCells = row.cells.filter(Boolean);
-      if (validCells.length === 0) return false;
-
-      if (showOnlyFailures) {
-        // no_judgment doesn't count as a failure — only real failed/error
-        if (!validCells.some((c) => c && (c.result.status === 'failed' || c.result.status === 'error'))) return false;
-      }
-      if (showOnlyDisagree) {
-        // Only meaningful over judged cells. If all cells are no_judgment, skip.
-        const judged = validCells.filter((c) => c && (c.result.status === 'passed' || c.result.status === 'failed'));
-        if (judged.length < 2) return false;
-        const outcomes = new Set(judged.map((c) => c!.result.status));
-        if (outcomes.size < 2) return false;
-      }
-      return true;
-    });
-  }, [matrix, showOnlyFailures, showOnlyDisagree]);
+    if (!showOnlyFailures) return matrix.rows;
+    return matrix.rows.filter((row) =>
+      row.cells.some((c) => c && c.result.status === 'failed'),
+    );
+  }, [matrix, showOnlyFailures]);
 
   // Column-level aggregates
-  const modelAggregates = useMemo(() => {
-    return matrix.modelIds.map((mid, colIdx) => {
+  const colAggregates = useMemo(() => {
+    return matrix.cols.map((col, colIdx) => {
       const cells = matrix.rows.map((r) => r.cells[colIdx]).filter(Boolean) as CellData[];
-      // Only cells with a real judgment count toward pass rate
-      const judged = cells.filter((c) => c.result.status === 'passed' || c.result.status === 'failed');
-      const passed = judged.filter((c) => c.result.status === 'passed').length;
-      const scored = cells.filter((c) => c.result.pass_score !== null);
-      const meanScore = scored.length === 0 ? null : scored.reduce((a, c) => a + (c.result.pass_score ?? 0), 0) / scored.length;
+      // "done" = any non-pending result. A child finishes by transitioning every
+      // result row out of pending (completed/failed/cancelled).
+      const done = cells.filter((c) => c.result.status !== 'pending').length;
+      const failed = cells.filter((c) => c.result.status === 'failed').length;
       const latencies = cells.filter((c) => c.result.latency_ms != null).map((c) => c.result.latency_ms!);
       const meanLatency = latencies.length === 0 ? null : latencies.reduce((a, b) => a + b, 0) / latencies.length;
-      const noJudgment = cells.length - judged.length;
+      const child = col.child;
+      const childStatus = child.status;
+      const isInFlight = childStatus === 'pending' || childStatus === 'running';
       return {
-        modelId: mid,
-        passed,
+        col,
+        done,
+        failed,
         total: cells.length,
-        judged: judged.length,
-        noJudgment,
-        passRate: judged.length === 0 ? null : passed / judged.length,
-        meanScore,
         meanLatency,
+        isInFlight,
+        childStatus,
       };
     });
   }, [matrix]);
+
+  // Cross-run progress for the in-flight selected run
+  const runProgress = useMemo(() => {
+    if (!detail) return null;
+    if (!(detail.status === 'pending' || detail.status === 'running')) return null;
+    const totalDone = detail.children.reduce(
+      (acc, c) => acc + c.results.filter((r) => r.status !== 'pending').length,
+      0,
+    );
+    const totalTotal = detail.children.reduce((acc, c) => acc + c.results.length, 0);
+    return totalTotal > 0 ? `${totalDone}/${totalTotal} cells` : null;
+  }, [detail]);
 
   if (!projectId) return null;
 
@@ -572,23 +662,26 @@ export function BatchComparePage() {
           <PaneBody>
             {runs.length === 0 && <Empty>No comparison runs yet.</Empty>}
             {runs.map((r) => {
-              const modelIds = parseJson<string[]>(r.model_config_ids, []);
+              const isSelected = selectedId === r.id;
               return (
                 <Card
                   key={r.id}
-                  $active={selectedId === r.id}
+                  $active={isSelected}
                   onClick={() => setSelectedId(r.id)}
                 >
                   <Row>
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <div style={{ fontSize: '0.88rem', fontWeight: 500 }}>{r.name}</div>
                       <Muted>
-                        {modelIds.length} models · <Badge color={
+                        <Badge color={
                           r.status === 'completed' ? 'success'
                           : r.status === 'failed' ? 'error'
                           : r.status === 'running' ? 'primary'
                           : 'secondary'
                         }>{r.status}</Badge>
+                        {isSelected && runProgress && (
+                          <> · <span style={{ color: tokens.colors.text.primary }}>{runProgress}</span></>
+                        )}
                       </Muted>
                     </div>
                     <Button
@@ -610,17 +703,42 @@ export function BatchComparePage() {
         <RightPane>
           {!selectedId && <Empty>Select a run on the left, or create a new one.</Empty>}
           {selectedId && !detail && <Empty>Loading…</Empty>}
-          {selectedId && detail && matrix.rows.length === 0 && <Empty>No test cases or no results yet.</Empty>}
+          {selectedId && detail && (
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 12,
+                marginBottom: tokens.spacing.md,
+              }}
+            >
+              <strong style={{ color: tokens.colors.text.primary }}>{detail.name}</strong>
+              <span
+                style={{
+                  fontFamily: tokens.fonts.mono,
+                  fontSize: '0.72rem',
+                  textTransform: 'uppercase',
+                  color: tokens.colors.text.muted,
+                }}
+              >
+                {detail.status}
+              </span>
+              {(detail.status === 'running' || detail.status === 'pending') && (
+                <Button size="sm" variant="danger" onClick={handleStop} style={{ marginLeft: 'auto' }}>
+                  Stop
+                </Button>
+              )}
+              {detail.status === 'cancelling' && (
+                <Button size="sm" variant="ghost" disabled style={{ marginLeft: 'auto' }}>
+                  Stopping…
+                </Button>
+              )}
+            </div>
+          )}
+          {selectedId && detail && matrix.rows.length === 0 && <Empty>No inputs or no results yet.</Empty>}
           {selectedId && detail && matrix.rows.length > 0 && (
             <>
               <FilterBar>
-                <label>
-                  <input
-                    type="checkbox"
-                    checked={showOnlyDisagree}
-                    onChange={(e) => setShowOnlyDisagree(e.target.checked)}
-                  /> Only rows where models disagree
-                </label>
                 <label>
                   <input
                     type="checkbox"
@@ -628,25 +746,6 @@ export function BatchComparePage() {
                     onChange={(e) => setShowOnlyFailures(e.target.checked)}
                   /> Only rows with failures
                 </label>
-                {assertionNames.length > 0 && (
-                  <label>
-                    Focus assertion:{' '}
-                    <select
-                      value={activeAssertion}
-                      onChange={(e) => setActiveAssertion(e.target.value)}
-                      style={{
-                        background: tokens.colors.bg.tertiary,
-                        border: `1px solid ${tokens.colors.border.subtle}`,
-                        color: tokens.colors.text.primary,
-                        padding: '4px 8px',
-                        borderRadius: 4,
-                      }}
-                    >
-                      <option value="">— overall —</option>
-                      {assertionNames.map((n) => <option key={n} value={n}>{n}</option>)}
-                    </select>
-                  </label>
-                )}
                 <div style={{ marginLeft: 'auto', color: tokens.colors.text.muted }}>
                   {filteredRows.length} / {matrix.rows.length} rows
                 </div>
@@ -655,30 +754,88 @@ export function BatchComparePage() {
               <Matrix>
                 <thead>
                   <tr>
-                    <Th style={{ minWidth: 200 }}>Test Case</Th>
-                    {matrix.modelIds.map((mid, colIdx) => {
+                    <Th style={{ minWidth: 200 }}>Input</Th>
+                    {matrix.cols.map((col, colIdx) => {
+                      const agg = colAggregates[colIdx];
+                      if (col.kind === 'chain') {
+                        // Chain columns own their internal prompts/models, so we
+                        // intentionally show only the chain name — no provider, no
+                        // prompt badge.
+                        const ch = chains.find((c) => c.id === col.id);
+                        return (
+                          <Th key={`chain:${col.id}`} style={{ minWidth: 220 }}>
+                            <div>{ch?.name ?? col.id.slice(0, 8)}</div>
+                            <Muted>chain</Muted>
+                            {agg && agg.total > 0 && (
+                              <div style={{ marginTop: 6 }}>
+                                {agg.isInFlight ? (
+                                  <Badge color="primary">
+                                    {agg.childStatus === 'running' ? '⟳ ' : ''}
+                                    {agg.done}/{agg.total} cells
+                                  </Badge>
+                                ) : (
+                                  <Badge color={agg.failed > 0 ? 'error' : 'secondary'}>
+                                    {agg.total - agg.failed}/{agg.total} ok
+                                    {agg.failed > 0 ? ` · ${agg.failed} failed` : ''}
+                                  </Badge>
+                                )}
+                                {!agg.isInFlight && agg.meanLatency !== null && (
+                                  <Muted>mean: {Math.round(agg.meanLatency)} ms</Muted>
+                                )}
+                              </div>
+                            )}
+                          </Th>
+                        );
+                      }
+                      const mid = col.id;
                       const m = models.find((x) => x.id === mid);
-                      const agg = modelAggregates[colIdx];
+                      // Source of truth for "this column ran an override prompt" is
+                      // the per-child prompt_version_id vs the parent's. A child
+                      // pinned to a different version than the parent ran an override.
+                      const usedPromptId = col.child.prompt_version_id;
+                      const hasOverride = !!usedPromptId
+                        && !!detail.prompt_version_id
+                        && usedPromptId !== detail.prompt_version_id;
                       return (
-                        <Th key={mid} style={{ minWidth: 220 }}>
+                        <Th key={`model:${mid}`} style={{ minWidth: 220 }}>
                           <div>{m?.name ?? mid.slice(0, 8)}</div>
                           <Muted>{m?.provider}</Muted>
+                          {usedPromptId && (
+                            <div style={{ marginTop: 4 }} title={`Prompt: ${promptVersionLabel(usedPromptId) ?? ''}`}>
+                              {hasOverride && (
+                                <>
+                                  <Badge color="primary">custom prompt</Badge>{' '}
+                                </>
+                              )}
+                              <Muted style={{ display: 'inline' }}>
+                                {promptVersionLabel(usedPromptId)}
+                              </Muted>
+                            </div>
+                          )}
                           {agg && agg.total > 0 && (
                             <div style={{ marginTop: 6 }}>
-                              {agg.judged > 0 ? (
-                                <Badge color={scoreColorVariant(agg.passRate ?? 0)}>
-                                  {agg.passed}/{agg.judged} pass ({Math.round((agg.passRate ?? 0) * 100)}%)
-                                </Badge>
+                              {agg.isInFlight ? (
+                                <>
+                                  <Badge color="primary">
+                                    {agg.childStatus === 'running' ? '⟳ ' : ''}
+                                    {agg.done}/{agg.total} cells
+                                  </Badge>
+                                  {agg.meanLatency !== null && agg.done < agg.total && (() => {
+                                    const remaining = agg.total - agg.done;
+                                    const etaSec = Math.round((agg.meanLatency * remaining) / 1000);
+                                    return <Muted>ETA ~{etaSec >= 60 ? `${Math.round(etaSec / 60)} min` : `${etaSec} s`}</Muted>;
+                                  })()}
+                                  {agg.meanLatency !== null && (
+                                    <Muted>{Math.round(agg.meanLatency)} ms / cell avg</Muted>
+                                  )}
+                                </>
                               ) : (
-                                <Badge color="secondary">{agg.total} outputs · no scoring</Badge>
+                                <Badge color={agg.failed > 0 ? 'error' : 'secondary'}>
+                                  {agg.total - agg.failed}/{agg.total} ok
+                                  {agg.failed > 0 ? ` · ${agg.failed} failed` : ''}
+                                </Badge>
                               )}
-                              {agg.noJudgment > 0 && agg.judged > 0 && (
-                                <Muted>+{agg.noJudgment} unscored</Muted>
-                              )}
-                              {agg.meanScore !== null && (
-                                <Muted>mean score: {agg.meanScore.toFixed(2)}</Muted>
-                              )}
-                              {agg.meanLatency !== null && (
+                              {!agg.isInFlight && agg.meanLatency !== null && (
                                 <Muted>mean: {Math.round(agg.meanLatency)} ms</Muted>
                               )}
                             </div>
@@ -689,48 +846,63 @@ export function BatchComparePage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {filteredRows.map((row) => (
-                    <tr key={row.testCase.id}>
+                  {filteredRows.map((row, rowIdx) => (
+                    <tr key={row.inputItem.id}>
                       <Td>
-                        <div style={{ fontWeight: 500 }}>{row.testCase.name}</div>
-                        {row.testCase.is_golden && <Badge color="warning">golden</Badge>}{' '}
-                        <Badge color="secondary">{row.testCase.expected_type}</Badge>
+                        <div style={{ fontWeight: 500 }}>
+                          {row.inputItem.name || `#${rowIdx + 1}`}
+                        </div>
+                        {row.inputItem.name && (
+                          <Muted style={{ marginTop: 2 }}>#{rowIdx + 1}</Muted>
+                        )}
+                        <Muted style={{
+                          color: tokens.colors.text.primary,
+                          whiteSpace: 'pre-wrap',
+                          wordBreak: 'break-word',
+                          fontFamily: tokens.fonts.mono,
+                          marginTop: 4,
+                        }}>
+                          {inputPreview(row.inputItem.input_text, 160)}
+                        </Muted>
                       </Td>
                       {row.cells.map((cell, colIdx) => {
-                        const cellKey = `${row.testCase.id}:${matrix.modelIds[colIdx]}`;
+                        const col = matrix.cols[colIdx];
+                        const colKey = `${col.kind}:${col.id}`;
+                        const cellKey = `${row.inputItem.id}:${colKey}`;
                         const isExpanded = expandedCellKey === cellKey;
                         if (!cell) {
-                          return <Td key={colIdx}><Muted>—</Muted></Td>;
+                          return <Td key={colKey}><Muted>—</Muted></Td>;
                         }
 
-                        const assertions = parseJson<AssertionResult[]>(cell.result.assertion_results || null, []);
-                        const noJudgment = cell.result.status === 'no_judgment';
-                        let displayScore = cell.result.pass_score ?? 0;
-                        let displayPass = cell.result.status === 'passed';
-                        if (activeAssertion) {
-                          const ar = assertions.find((a) => a.name === activeAssertion);
-                          displayScore = ar?.score ?? 0;
-                          displayPass = ar?.passed ?? false;
-                        }
+                        const status = cell.result.status;
+                        const isFailed = status === 'failed';
+                        const isPending = status === 'pending';
+                        const isCancelled = status === 'cancelled';
 
-                        const modelName = models.find((x) => x.id === matrix.modelIds[colIdx])?.name ?? matrix.modelIds[colIdx].slice(0, 8);
+                        const modelName = col.kind === 'chain'
+                          ? (chains.find((c) => c.id === col.id)?.name ?? col.id.slice(0, 8))
+                          : (models.find((x) => x.id === col.id)?.name ?? col.id.slice(0, 8));
+
+                        const cleanedOutput = col.kind === 'chain'
+                          ? prettyChainOutput(cell.result.actual_output)
+                          : stripThinkTags(cell.result.actual_output);
+
                         return (
                           <Td
-                            key={colIdx}
-                            $pass={!noJudgment && displayPass && !activeAssertion}
-                            $fail={!noJudgment && !displayPass && cell.result.status !== 'pending'}
+                            key={colKey}
+                            $fail={isFailed}
                             onClick={() => setExpandedCellKey(isExpanded ? null : cellKey)}
                             style={{ cursor: 'pointer' }}
                           >
                             <Row>
-                              {noJudgment ? (
-                                <Badge color="secondary" title="No assertions and no expected_output — showing raw output only. Add assertions on the test case to get per-field scoring.">
-                                  raw output
-                                </Badge>
+                              {isPending ? (
+                                <Badge color="secondary">pending</Badge>
+                              ) : isFailed ? (
+                                <Badge color="error">failed</Badge>
+                              ) : isCancelled ? (
+                                <Badge color="secondary">cancelled</Badge>
                               ) : (
-                                <Badge color={displayPass ? 'success' : 'error'}>
-                                  {Math.round(displayScore * 100)}%
-                                </Badge>
+                                <Badge color="success">ok</Badge>
                               )}
                               <div style={{ display: 'flex', gap: 4, fontSize: '0.7rem', color: tokens.colors.text.muted, alignItems: 'center' }}>
                                 {cell.result.cache_hit && <span title="From cache">⚡</span>}
@@ -743,7 +915,7 @@ export function BatchComparePage() {
                                     style={{ padding: '1px 6px', fontSize: '0.65rem', opacity: 0.7 }}
                                     onClick={(e) => {
                                       e.stopPropagation();
-                                      openAddToDataset({ testCase: row.testCase, cell, modelName });
+                                      openAddToDataset({ inputItem: row.inputItem, cell, modelName });
                                     }}
                                   >
                                     + Dataset
@@ -751,8 +923,7 @@ export function BatchComparePage() {
                                 )}
                               </div>
                             </Row>
-                            {!noJudgment && <ScoreBar $score={displayScore} style={{ marginTop: 4 }} />}
-                            {noJudgment && cell.result.actual_output && (
+                            {cleanedOutput && (
                               <Muted style={{
                                 marginTop: 4,
                                 fontFamily: tokens.fonts.mono,
@@ -762,62 +933,26 @@ export function BatchComparePage() {
                                 whiteSpace: 'pre-wrap',
                                 wordBreak: 'break-word',
                               }}>
-                                {cell.result.actual_output.slice(0, 180)}
-                                {cell.result.actual_output.length > 180 && '…'}
+                                {cleanedOutput.slice(0, 180)}
+                                {cleanedOutput.length > 180 && '…'}
                               </Muted>
                             )}
 
                             {isExpanded && (
                               <div style={{ marginTop: 8 }}>
-                                {assertions.length > 0 ? (
-                                  <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                                    {assertions.map((ar, i) => (
-                                      <div key={i} style={{
-                                        padding: '6px 8px',
-                                        background: tokens.colors.bg.primary,
-                                        borderRadius: 4,
-                                        border: `1px solid ${tokens.colors.border.subtle}`,
-                                        fontSize: '0.72rem',
-                                      }}>
-                                        <Row>
-                                          <span>
-                                            <Badge color={ar.passed ? 'success' : 'error'}>
-                                              {Math.round(ar.score * 100)}%
-                                            </Badge>
-                                            {' '}<strong>{ar.name}</strong>
-                                          </span>
-                                          {ar.weight !== 1 && <Muted>w={ar.weight}</Muted>}
-                                        </Row>
-                                        {ar.path && <Muted>{ar.path}</Muted>}
-                                        {ar.reasoning && (
-                                          <div style={{ color: tokens.colors.text.secondary, marginTop: 2 }}>
-                                            {ar.reasoning}
-                                          </div>
-                                        )}
-                                        {(ar.actual_value !== null || ar.expected_value !== null) && (
-                                          <div style={{ fontFamily: tokens.fonts.mono, fontSize: '0.68rem', color: tokens.colors.text.muted, marginTop: 2 }}>
-                                            expected: {JSON.stringify(ar.expected_value)}<br />
-                                            actual: {JSON.stringify(ar.actual_value)}
-                                          </div>
-                                        )}
-                                      </div>
-                                    ))}
-                                  </div>
-                                ) : (
-                                  <pre style={{
-                                    whiteSpace: 'pre-wrap',
-                                    wordBreak: 'break-word',
-                                    background: tokens.colors.bg.primary,
-                                    padding: 8,
-                                    borderRadius: 4,
-                                    maxHeight: 200,
-                                    overflow: 'auto',
-                                    fontSize: '0.7rem',
-                                    margin: 0,
-                                  }}>
-                                    {cell.result.actual_output || '(no output)'}
-                                  </pre>
-                                )}
+                                <pre style={{
+                                  whiteSpace: 'pre-wrap',
+                                  wordBreak: 'break-word',
+                                  background: tokens.colors.bg.primary,
+                                  padding: 8,
+                                  borderRadius: 4,
+                                  maxHeight: 300,
+                                  overflow: 'auto',
+                                  fontSize: '0.7rem',
+                                  margin: 0,
+                                }}>
+                                  {cleanedOutput || '(no output)'}
+                                </pre>
                                 {cell.result.error_message && (
                                   <Muted style={{ color: tokens.colors.accent.error, marginTop: 4 }}>
                                     {cell.result.error_message}
@@ -854,12 +989,12 @@ export function BatchComparePage() {
               ) : (
                 <>
                   <FormGroup>
-                    <Label>Input (test case)</Label>
-                    <PreviewBox>{addTarget.testCase.input_text}</PreviewBox>
+                    <Label>Input</Label>
+                    <PreviewBox>{addTarget.inputItem.input_text}</PreviewBox>
                   </FormGroup>
                   <FormGroup>
                     <Label>Output ({addTarget.modelName})</Label>
-                    <PreviewBox>{addTarget.cell.result.actual_output ?? '(no output)'}</PreviewBox>
+                    <PreviewBox>{stripThinkTags(addTarget.cell.result.actual_output) || '(no output)'}</PreviewBox>
                   </FormGroup>
 
                   <FormGroup>
@@ -915,9 +1050,9 @@ export function BatchComparePage() {
               </FormGroup>
 
               <FormGroup>
-                <Label>Prompt Version</Label>
+                <Label>Default Prompt Version (optional if every model has an override)</Label>
                 <Select value={promptVersionId} onChange={(e) => setPromptVersionId(e.target.value)}>
-                  <option value="">Select...</option>
+                  <option value="">— none (each model must have its own override) —</option>
                   {promptVersions.map((v) => (
                     <option key={v.id} value={v.id}>
                       {v.promptName} v{v.version_number}{v.label ? ` (${v.label})` : ''}
@@ -927,96 +1062,204 @@ export function BatchComparePage() {
               </FormGroup>
 
               <FormGroup>
-                <Label>Models to compare (select 2 or more)</Label>
+                <Label>Models to run (optional if you pick at least one chain below)</Label>
+                <Muted style={{ marginBottom: 6 }}>
+                  Each selected model uses the prompt version above by default. Click
+                  <em> override</em> to give a model its own prompt — handy when a 3B model
+                  needs a longer, more explicit prompt than a frontier model.
+                </Muted>
                 <CheckList>
-                  {enabledModels.map((m) => (
-                    <CheckRow key={m.id}>
-                      <input
-                        type="checkbox"
-                        checked={selectedModelIds.has(m.id)}
-                        onChange={(e) => {
-                          setSelectedModelIds((prev) => {
-                            const next = new Set(prev);
-                            if (e.target.checked) next.add(m.id); else next.delete(m.id);
-                            return next;
-                          });
-                        }}
-                      />
-                      {m.name} <Muted>{m.provider}</Muted>
-                    </CheckRow>
-                  ))}
+                  {enabledModels.map((m) => {
+                    const checked = selectedModelIds.has(m.id);
+                    const overrideVid = promptOverrides[m.id] ?? '';
+                    return (
+                      <div key={m.id} style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                        <CheckRow>
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={(e) => {
+                              setSelectedModelIds((prev) => {
+                                const next = new Set(prev);
+                                if (e.target.checked) next.add(m.id); else next.delete(m.id);
+                                return next;
+                              });
+                              if (!e.target.checked) {
+                                setPromptOverrides((prev) => {
+                                  if (!(m.id in prev)) return prev;
+                                  const next = { ...prev };
+                                  delete next[m.id];
+                                  return next;
+                                });
+                              }
+                            }}
+                          />
+                          <span style={{ flex: 1 }}>
+                            {m.name} <Muted>{m.provider}</Muted>
+                          </span>
+                          {overrideVid && <Badge color="primary">custom prompt</Badge>}
+                        </CheckRow>
+                        {checked && (
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 6, paddingLeft: 24 }}>
+                            <Muted style={{ marginTop: 0 }}>prompt:</Muted>
+                            <Select
+                              value={overrideVid}
+                              onChange={(e) => {
+                                const v = e.target.value;
+                                setPromptOverrides((prev) => {
+                                  const next = { ...prev };
+                                  if (!v) delete next[m.id];
+                                  else next[m.id] = v;
+                                  return next;
+                                });
+                              }}
+                              style={{ flex: 1, padding: '4px 8px', fontSize: '0.75rem' }}
+                            >
+                              <option value="">— inherit from above —</option>
+                              {promptVersions.map((v) => (
+                                <option key={v.id} value={v.id}>
+                                  {v.promptName} v{v.version_number}{v.label ? ` (${v.label})` : ''}
+                                </option>
+                              ))}
+                            </Select>
+                            {overrideVid && (
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                onClick={() => setPromptOverrides((prev) => {
+                                  const next = { ...prev };
+                                  delete next[m.id];
+                                  return next;
+                                })}
+                                style={{ fontSize: '0.7rem', padding: '2px 6px' }}
+                              >
+                                reset
+                              </Button>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
                 </CheckList>
               </FormGroup>
 
+              {chains.length > 0 && (
+                <FormGroup>
+                  <Label>Chains as columns (optional)</Label>
+                  <Muted style={{ marginBottom: 6 }}>
+                    Each selected chain runs end-to-end per input row; the chain's
+                    full <code>{'{node_name: text}'}</code> output becomes the column value.
+                    Chains carry their own prompts and per-node models, so the prompt picker
+                    above doesn't apply.
+                  </Muted>
+                  <CheckList>
+                    {chains.map((c) => {
+                      const checked = selectedChainIds.has(c.id);
+                      return (
+                        <CheckRow key={c.id}>
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={(e) => {
+                              setSelectedChainIds((prev) => {
+                                const next = new Set(prev);
+                                if (e.target.checked) next.add(c.id); else next.delete(c.id);
+                                return next;
+                              });
+                            }}
+                          />
+                          <span style={{ flex: 1 }}>
+                            {c.name} <Muted>{c.node_count} nodes</Muted>
+                          </span>
+                        </CheckRow>
+                      );
+                    })}
+                  </CheckList>
+                </FormGroup>
+              )}
+
               <FormGroup>
-                <Label>Knowledge Base</Label>
-                <Select value={selectedKbId} onChange={(e) => setSelectedKbId(e.target.value)}>
-                  <option value="">— pick a knowledge base —</option>
-                  {kbs.map((kb) => (
-                    <option key={kb.id} value={kb.id}>
-                      {kb.name} ({kb.item_count} items)
+                <Label>Input Dataset</Label>
+                <Select value={inputDatasetId} onChange={(e) => setInputDatasetId(e.target.value)}>
+                  <option value="">— pick an input dataset —</option>
+                  {inputDatasets.map((d) => (
+                    <option key={d.id} value={d.id}>
+                      {d.name} ({d.item_count} items)
                     </option>
                   ))}
                 </Select>
                 <Muted style={{ marginTop: 4 }}>
-                  Selected items become inputs for every model. First use auto-creates a test case
-                  per item (found next time via source_kb_item_id — expected_output and assertions
-                  stay empty until you add them in Post-Training → Backtesting).
+                  Pulls from the global "Datasets" sidebar (input libraries) — not the
+                  Fine-Tuning datasets in Post-Training. Every item's <code>content</code> is
+                  sent to each model as one input row. RAG retrieval, if any, comes from
+                  the prompt version's KB binding — not from here.
                 </Muted>
               </FormGroup>
 
-              {selectedKbId && (
+              {inputDatasetId && (
                 <FormGroup>
-                  <Label>KB items to include ({selectedKbItemIds.size})</Label>
-                  {loadingKbItems ? (
+                  <Label>Items to include ({selectedItemIds.size}/{datasetItems.length})</Label>
+                  {loadingDatasetItems ? (
                     <Muted>Loading items…</Muted>
-                  ) : kbItems.length === 0 ? (
-                    <Muted>This KB has no items yet.</Muted>
+                  ) : datasetItems.length === 0 ? (
+                    <Muted>This dataset has no items yet.</Muted>
                   ) : (
                     <>
                       <Row style={{ justifyContent: 'flex-end', gap: 6 }}>
                         <Button
                           size="sm"
                           variant="ghost"
-                          onClick={() => setSelectedKbItemIds(new Set(kbItems.map((it) => it.id)))}
+                          onClick={() => setSelectedItemIds(new Set(datasetItems.map((it) => it.id)))}
                         >
                           Select all
                         </Button>
                         <Button
                           size="sm"
                           variant="ghost"
-                          onClick={() => setSelectedKbItemIds(new Set())}
+                          onClick={() => setSelectedItemIds(new Set())}
                         >
                           Clear
                         </Button>
                       </Row>
                       <CheckList>
-                        {kbItems.map((it) => (
-                          <CheckRow key={it.id}>
-                            <input
-                              type="checkbox"
-                              checked={selectedKbItemIds.has(it.id)}
-                              onChange={(e) => {
-                                setSelectedKbItemIds((prev) => {
-                                  const next = new Set(prev);
-                                  if (e.target.checked) next.add(it.id); else next.delete(it.id);
-                                  return next;
-                                });
-                              }}
-                            />
-                            <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                              {it.name}
-                            </span>
-                            <Badge color={
-                              it.source_type === 'pdf' ? 'primary'
-                              : it.source_type === 'csv_row' ? 'warning'
-                              : 'secondary'
-                            }>
-                              {it.source_type}
-                            </Badge>
-                            <Muted>{it.content.length.toLocaleString()} ch</Muted>
-                          </CheckRow>
-                        ))}
+                        {datasetItems.map((it, i) => {
+                          const preview = it.name || it.content || '(empty)';
+                          const checked = selectedItemIds.has(it.id);
+                          return (
+                            <CheckRow key={it.id}>
+                              <input
+                                type="checkbox"
+                                checked={checked}
+                                onChange={(e) => {
+                                  setSelectedItemIds((prev) => {
+                                    const next = new Set(prev);
+                                    if (e.target.checked) next.add(it.id); else next.delete(it.id);
+                                    return next;
+                                  });
+                                }}
+                              />
+                              <span style={{
+                                flex: 1,
+                                minWidth: 0,
+                                overflow: 'hidden',
+                                textOverflow: 'ellipsis',
+                                whiteSpace: 'nowrap',
+                              }}>
+                                <Muted style={{ display: 'inline', marginRight: 6 }}>#{i + 1}</Muted>
+                                {preview}
+                              </span>
+                              <Badge color={
+                                it.source_type === 'pdf' ? 'primary'
+                                : it.source_type === 'csv_row' ? 'warning'
+                                : 'secondary'
+                              }>
+                                {it.source_type}
+                              </Badge>
+                              <Muted>{(it.content?.length ?? 0).toLocaleString()} ch</Muted>
+                            </CheckRow>
+                          );
+                        })}
                       </CheckList>
                     </>
                   )}
@@ -1024,7 +1267,7 @@ export function BatchComparePage() {
               )}
 
               <FormGroup>
-                <Label>LLM Judge Model (optional — used for llm_judge assertions)</Label>
+                <Label>LLM Judge Model (reserved — no scoring runs without expected outputs)</Label>
                 <Select value={judgeModelId} onChange={(e) => setJudgeModelId(e.target.value)}>
                   <option value="">— none —</option>
                   {enabledModels.map((m) => (
@@ -1036,9 +1279,14 @@ export function BatchComparePage() {
               <Button
                 disabled={
                   !name.trim()
-                  || !promptVersionId
-                  || selectedModelIds.size < 2
-                  || selectedKbItemIds.size === 0
+                  || (selectedModelIds.size < 1 && selectedChainIds.size < 1)
+                  || !inputDatasetId
+                  || selectedItemIds.size === 0
+                  // Default-prompt requirement only applies when at least one
+                  // model column is selected. Chain-only runs ignore it.
+                  || (selectedModelIds.size > 0
+                      && !promptVersionId
+                      && !Array.from(selectedModelIds).every((mid) => !!promptOverrides[mid]))
                 }
                 onClick={handleCreate}
               >
@@ -1055,60 +1303,61 @@ export function BatchComparePage() {
 /* ─── Matrix building ────────────────────────────────────────────────────── */
 
 interface AddToDatasetTarget {
-  testCase: TestCase;
+  inputItem: ComparisonInputItem;
   cell: CellData;
   modelName: string;
 }
 
 interface CellData {
-  run: BacktestRun;
-  result: BacktestResult;
+  child: ComparisonChild;
+  result: ComparisonResult;
 }
 
 interface MatrixRow {
-  testCase: TestCase;
+  inputItem: ComparisonInputItem;
   cells: (CellData | null)[];
 }
 
+// A column corresponds 1:1 with a ComparisonChild. We carry the full child
+// so the renderer has prompt_version_id, status, and friends without re-lookup.
+type MatrixCol =
+  | { kind: 'model'; id: string; child: ComparisonChild }
+  | { kind: 'chain'; id: string; child: ComparisonChild };
+
 interface MatrixData {
-  modelIds: string[];
+  cols: MatrixCol[];
   rows: MatrixRow[];
 }
 
-function buildMatrix(
-  detail: ComparisonRunWithChildren | null,
-  _models: unknown,
-): MatrixData {
-  if (!detail) return { modelIds: [], rows: [] };
+function buildMatrix(detail: ComparisonRunWithChildren | null): MatrixData {
+  if (!detail) return { cols: [], rows: [] };
 
-  // Columns follow the order of the comparison run's declared model list
-  let modelIds: string[] = [];
-  try {
-    modelIds = JSON.parse(detail.model_config_ids) as string[];
-  } catch {
-    modelIds = detail.children.map((c) => c.model_config_id);
-  }
+  // Children already arrive in `ordering` from the backend. Discriminate by
+  // `kind` (the canonical field) — `chain_id` / `model_config_id` are just
+  // typed lookup keys.
+  const cols: MatrixCol[] = detail.children.map((c) => {
+    if (c.kind === 'chain') {
+      return { kind: 'chain' as const, id: c.chain_id ?? c.id, child: c };
+    }
+    return { kind: 'model' as const, id: c.model_config_id ?? c.id, child: c };
+  });
 
-  // Gather a unified set of test-case ids across all children (preserve order of first child)
-  const tcMap = new Map<string, TestCase>();
+  // Index results by (child_id, input_item_id) for O(1) lookup.
+  const resultIndex = new Map<string, ComparisonResult>();
   for (const child of detail.children) {
-    for (const res of child.results) {
-      if (res.test_case && !tcMap.has(res.test_case.id)) {
-        tcMap.set(res.test_case.id, res.test_case);
-      }
+    for (const r of child.results) {
+      resultIndex.set(`${child.id}:${r.input_item_id}`, r);
     }
   }
 
-  const rows: MatrixRow[] = Array.from(tcMap.values()).map((tc) => {
-    const cells = modelIds.map((mid) => {
-      const child = detail.children.find((c) => c.model_config_id === mid);
-      if (!child) return null;
-      const res = child.results.find((r) => r.test_case_id === tc.id);
-      if (!res) return null;
-      return { run: child, result: res };
+  const rows: MatrixRow[] = detail.input_items.map((item) => {
+    const cells = cols.map((col) => {
+      const r = resultIndex.get(`${col.child.id}:${item.id}`);
+      if (!r) return null;
+      return { child: col.child, result: r };
     });
-    return { testCase: tc, cells };
+    return { inputItem: item, cells };
   });
 
-  return { modelIds, rows };
+  return { cols, rows };
 }

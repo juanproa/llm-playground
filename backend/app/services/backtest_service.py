@@ -19,7 +19,7 @@ from app.models.model_config import ModelConfig
 from app.models.post_training import BacktestResult, BacktestRun, InferenceCache, TestCase
 from app.models.prompt import PromptVersion
 from app.providers.registry import get_provider
-from app.services import assertion_engine
+from app.services import assertion_engine, test_case_pii_service
 from app.services.inference_service import _final_cleanup
 from app.services.model_config_service import decrypt_api_key
 
@@ -438,6 +438,12 @@ async def _execute_backtest(db: AsyncSession, backtest_run_id: str) -> None:
 
         # Reload results in this session to aggregate — each child committed in its own session
         await db.commit()  # release any locks on our side first
+        # Each child commit happened on its own AsyncSession, so the rows in
+        # this session's identity map are stale (still showing the initial
+        # status="pending"). expire_all() forces the next access to refetch
+        # from the DB; without it the SELECT below returns the cached stale
+        # objects and pass/fail counts always come out as 0.
+        db.expire_all()
         await db.refresh(run)
         agg_rows = await db.execute(
             select(BacktestResult).where(BacktestResult.backtest_run_id == backtest_run_id)
@@ -504,7 +510,15 @@ async def _run_single_case(
             return {"result_id": result_id, "status": "error",
                     "error_message": "Test case not found"}
         tc_id = test_case.id
-        tc_input = test_case.input_text
+        # PII guarantee: when the test case was materialized from an InputDatasetItem
+        # that has been PII-masked, the masked content is the only version that
+        # may be sent to the model or the judge. See test_case_pii_service.
+        tc_input = await test_case_pii_service.get_safe_input_text(read_db, test_case)
+        # Hash the safe input — the InferenceCache key includes this so that
+        # re-running after the source has been masked produces a cache miss
+        # (different text → different hash) instead of a stale raw-data hit.
+        import hashlib as _hashlib
+        tc_input_hash = _hashlib.sha256((tc_input or "").encode("utf-8")).hexdigest()
         tc_expected = test_case.expected_output or ""
         tc_expected_type = test_case.expected_type
         tc_document_id = test_case.document_id
@@ -547,7 +561,7 @@ async def _run_single_case(
         extra_params.setdefault("adapter_path", model_snap["adapter_path"])
 
     start = time.monotonic()
-    cache_hit = False
+    cache_hit = False  # always False now — kept for column compat
     actual = None
     elapsed_ms = 0
     error_message = None
@@ -557,52 +571,20 @@ async def _run_single_case(
 
     try:
         max_tokens = model_snap["max_tokens"]
-        # ── Try inference cache (read-only, short session) ──
-        async with _DB_WRITE_LOCK:
-            async with async_session() as cache_db:
-                cached = await _lookup_cache(
-                    cache_db,
-                    prompt_version_id=run_snap["prompt_version_id"],
-                    model_config_id=run_snap["model_config_id"],
-                    test_case_id=tc_id,
-                    document_id=tc_document_id,
-                    max_tokens=max_tokens,
-                    temperature=model_snap["temperature"],
-                )
-                if cached is not None:
-                    # Strip again on read — old cached outputs may have been
-                    # stored before the at-storage strip was added.
-                    actual = _strip_think(cached.output)
-                    elapsed_ms = cached.latency_ms or 0
-                    cache_hit = True
-
-        # ── Call the model (slow — happens outside any lock) ──
-        if actual is None:
-            response = await provider.generate(
-                messages=messages,
-                model_id=model_snap["model_id"],
-                max_tokens=max_tokens,
-                temperature=model_snap["temperature"],
-                **extra_params,
-            )
-            elapsed_ms = int((time.monotonic() - start) * 1000)
-            actual = _strip_think(response.content)
-
-            # Store to cache (write under lock)
-            async with _DB_WRITE_LOCK:
-                async with async_session() as cache_db:
-                    await _store_cache(
-                        cache_db,
-                        prompt_version_id=run_snap["prompt_version_id"],
-                        model_config_id=run_snap["model_config_id"],
-                        test_case_id=tc_id,
-                        document_id=tc_document_id,
-                        max_tokens=max_tokens,
-                        temperature=model_snap["temperature"],
-                        output=actual,
-                        latency_ms=elapsed_ms,
-                    )
-                    await cache_db.commit()
+        # InferenceCache lookup is intentionally disabled. "Run Backtest" must
+        # always call the model — replaying a cached output is not a re-run,
+        # and the user has explicitly asked for fresh model calls every time.
+        # The pt_inference_cache table is left in place for analytics / future
+        # opt-in caching, but no row is ever read or written here.
+        response = await provider.generate(
+            messages=messages,
+            model_id=model_snap["model_id"],
+            max_tokens=max_tokens,
+            temperature=model_snap["temperature"],
+            **extra_params,
+        )
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        actual = _strip_think(response.content)
 
         # ── Score the output (no DB needed — pure compute) ──
         tc_threshold = tc_pass_threshold if tc_pass_threshold is not None else run_threshold
@@ -671,8 +653,14 @@ async def _lookup_cache(
     document_id: str | None,
     max_tokens: int,
     temperature: float,
+    input_hash: str,
 ) -> InferenceCache | None:
-    """Return the cached InferenceCache row for this key, or None."""
+    """Return the cached InferenceCache row for this key, or None.
+
+    `input_hash` MUST match exactly. Old cache rows from before the column
+    existed have `input_hash IS NULL`, which never equals a non-null hash —
+    so they don't accidentally serve stale outputs after a source is masked.
+    """
     from sqlalchemy import and_
     q = select(InferenceCache).where(and_(
         InferenceCache.prompt_version_id == prompt_version_id,
@@ -680,6 +668,7 @@ async def _lookup_cache(
         InferenceCache.test_case_id == test_case_id,
         InferenceCache.max_tokens == max_tokens,
         InferenceCache.temperature == temperature,
+        InferenceCache.input_hash == input_hash,
     ))
     if document_id is None:
         q = q.where(InferenceCache.document_id.is_(None))
@@ -698,6 +687,7 @@ async def _store_cache(
     document_id: str | None,
     max_tokens: int,
     temperature: float,
+    input_hash: str,
     output: str,
     latency_ms: int,
 ) -> None:
@@ -710,6 +700,7 @@ async def _store_cache(
             document_id=document_id,
             max_tokens=max_tokens,
             temperature=temperature,
+            input_hash=input_hash,
             output=output,
             latency_ms=latency_ms,
         )

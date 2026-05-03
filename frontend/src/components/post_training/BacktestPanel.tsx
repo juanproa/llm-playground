@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import styled from 'styled-components';
+import * as XLSX from 'xlsx';
 import { tokens } from '../../theme/tokens';
 import { Button } from '../common/Button';
 import { Badge } from '../common/Badge';
@@ -9,6 +10,7 @@ import { useModelStore } from '../../stores/modelStore';
 import type { AssertionSpec, BacktestResult, BacktestRun, TestCase } from '../../types';
 import { AssertionsEditor } from './AssertionsEditor';
 import { ExpectedOutputPicker } from './ExpectedOutputPicker';
+import { AddToDatasetModal, type AddToDatasetItem } from './AddToDatasetModal';
 
 function parseAssertions(raw: string | null): AssertionSpec[] {
   if (!raw) return [];
@@ -18,6 +20,94 @@ function parseAssertions(raw: string | null): AssertionSpec[] {
   } catch {
     return [];
   }
+}
+
+/** Format an assertion as a single readable line for CSV export. */
+function formatAssertion(a: AssertionSpec): string {
+  const parts: string[] = [];
+  parts.push(a.name || '(unnamed)');
+  parts.push(`${a.type}${a.path ? ` @${a.path}` : ''}`);
+  if (a.expected !== undefined && a.expected !== null) {
+    const expected =
+      typeof a.expected === 'string' ? a.expected : JSON.stringify(a.expected);
+    parts.push(`expected=${expected}`);
+  }
+  if (a.weight != null && a.weight !== 1) {
+    parts.push(`weight=${a.weight}`);
+  }
+  return parts.join(' | ');
+}
+
+/**
+ * Excel hard-caps cell text at 32,767 characters. Any longer content has to be
+ * truncated or the workbook generation throws "Text length must not exceed 32767
+ * characters". We leave room for a clear "[…truncated]" suffix.
+ */
+const EXCEL_CELL_LIMIT = 32767;
+const EXCEL_TRUNCATION_SUFFIX = '\n\n[…truncated for Excel]';
+function clipForExcel(value: string | number | null): string | number | null {
+  if (typeof value !== 'string') return value;
+  if (value.length <= EXCEL_CELL_LIMIT) return value;
+  return value.slice(0, EXCEL_CELL_LIMIT - EXCEL_TRUNCATION_SUFFIX.length) + EXCEL_TRUNCATION_SUFFIX;
+}
+
+/**
+ * Build an .xlsx workbook from a header row and data rows, then trigger a download.
+ * Sheet column widths are auto-sized (capped) and the header row is bold.
+ */
+function downloadXlsx(
+  filename: string,
+  sheetName: string,
+  headers: string[],
+  rows: (string | number | null)[][],
+) {
+  // Clip every cell to Excel's 32,767-char limit so writing never throws on
+  // long PDF dumps or model outputs.
+  const safeRows = rows.map((row) => row.map(clipForExcel));
+  const aoa: (string | number | null)[][] = [headers, ...safeRows];
+  const ws = XLSX.utils.aoa_to_sheet(aoa);
+
+  // Auto-fit column widths (capped at 80 chars to keep wide cells readable)
+  const colWidths = headers.map((h, i) => {
+    const maxLen = Math.max(
+      h.length,
+      ...rows.map((r) => {
+        const v = r[i];
+        if (v == null) return 0;
+        const s = String(v);
+        // For multi-line cells, use the longest single line so columns aren't unreadable
+        return s.split('\n').reduce((m, line) => Math.max(m, line.length), 0);
+      }),
+    );
+    return { wch: Math.min(Math.max(maxLen + 2, 12), 80) };
+  });
+  ws['!cols'] = colWidths;
+
+  // Bold the header row
+  for (let c = 0; c < headers.length; c++) {
+    const cellRef = XLSX.utils.encode_cell({ r: 0, c });
+    if (ws[cellRef]) {
+      ws[cellRef].s = { font: { bold: true } };
+    }
+  }
+
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, sheetName);
+
+  // Generate a binary array buffer and trigger our own download (consistent
+  // across browsers and easier to reason about than XLSX.writeFile).
+  const buffer = XLSX.write(wb, { bookType: 'xlsx', type: 'array' }) as ArrayBuffer;
+  const blob = new Blob([buffer], {
+    type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
 }
 
 interface Props {
@@ -314,6 +404,55 @@ const DetailField = styled.div`
   gap: 2px;
 `;
 
+const DetailFieldHeader = styled.div`
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+`;
+
+const CopyButton = styled.button`
+  background: transparent;
+  border: 1px solid ${tokens.colors.border.subtle};
+  border-radius: ${tokens.radii.sm};
+  color: ${tokens.colors.text.secondary};
+  font-family: ${tokens.fonts.accent};
+  font-size: 0.65rem;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 2px 8px;
+  cursor: pointer;
+  transition: all 0.12s ease;
+
+  &:hover {
+    color: ${tokens.colors.text.primary};
+    border-color: ${tokens.colors.accent.primary};
+  }
+
+  &:active {
+    transform: scale(0.96);
+  }
+`;
+
+const TestCaseLink = styled.button`
+  background: transparent;
+  border: none;
+  color: ${tokens.colors.accent.primary};
+  font-family: inherit;
+  font-size: inherit;
+  padding: 0;
+  cursor: pointer;
+  text-align: left;
+  text-decoration: underline;
+  text-decoration-style: dotted;
+  text-underline-offset: 3px;
+
+  &:hover {
+    text-decoration-style: solid;
+  }
+`;
+
 const DetailLabel = styled.div`
   font-family: ${tokens.fonts.accent};
   font-size: 0.65rem;
@@ -415,6 +554,16 @@ export function BacktestPanel({ projectId }: Props) {
   const [expandedResultId, setExpandedResultId] = useState<string | null>(null);
   const [expandedCaseId, setExpandedCaseId] = useState<string | null>(null);
   const [selectedCaseIds, setSelectedCaseIds] = useState<Set<string>>(new Set());
+  const [copiedCaseId, setCopiedCaseId] = useState<string | null>(null);
+
+  // Add-to-SFT-Dataset modal state
+  const [addToDatasetItems, setAddToDatasetItems] = useState<AddToDatasetItem[]>([]);
+  const [addToDatasetTitle, setAddToDatasetTitle] = useState('Add to SFT Dataset');
+  const [addToDatasetDefaults, setAddToDatasetDefaults] = useState<{
+    instruction?: string;
+    systemMessage?: string;
+  }>({});
+  const [showAddToDataset, setShowAddToDataset] = useState(false);
 
   // New test case form
   const [caseName, setCaseName] = useState('');
@@ -525,6 +674,186 @@ export function BacktestPanel({ projectId }: Props) {
     }
   }
 
+  /**
+   * Trigger PII masking on every test case with `pii_status='unchecked'`.
+   * The backend kicks off a background task; we poll `loadData` a few times
+   * so the user sees status badges flip from "unchecked" → "masked"/"clean"
+   * without having to refresh manually.
+   */
+  async function handleMaskPii() {
+    try {
+      const r = await postTrainingApi.maskTestCasesPii(projectId);
+      if (r.queued_count === 0) {
+        alert('All test cases are already PII-checked.');
+        return;
+      }
+      alert(`PII masking started for ${r.queued_count} test case(s). Status will update as items are processed.`);
+      // Poll for progress every 3s for up to 60s
+      let ticks = 0;
+      const maxTicks = 20;
+      const interval = setInterval(async () => {
+        ticks += 1;
+        try {
+          await loadData();
+        } catch {
+          /* ignore — keep polling */
+        }
+        const stillUnchecked = (
+          await postTrainingApi.listTestCases(projectId).catch(() => [])
+        ).filter((t) => t.pii_status === 'unchecked').length;
+        if (stillUnchecked === 0 || ticks >= maxTicks) {
+          clearInterval(interval);
+        }
+      }, 3000);
+    } catch (e) {
+      alert(`Mask PII failed: ${(e as Error).message}`);
+    }
+  }
+
+  async function copyInputToClipboard(tc: TestCase) {
+    try {
+      await navigator.clipboard.writeText(tc.input_text);
+      setCopiedCaseId(tc.id);
+      setTimeout(() => {
+        setCopiedCaseId((prev) => (prev === tc.id ? null : prev));
+      }, 1500);
+    } catch (e) {
+      alert(`Copy failed: ${(e as Error).message}`);
+    }
+  }
+
+  /**
+   * Export the current backtest run's results to an Excel (.xlsx) file.
+   * Columns: Case name | PII data | Asserts | Output
+   *
+   * - "PII data" is the masked input text from the source dataset item
+   *   (TestCaseResponse.input_text is already PII-safe at the API boundary).
+   * - "Output" is the raw model output as text (no JSON pretty-printing —
+   *   what the model produced, verbatim).
+   */
+  function handleExportBacktestXlsx() {
+    if (!selectedRun) return;
+
+    const headers = ['Case name', 'PII data', 'Asserts', 'Output'];
+
+    const rows: (string | number | null)[][] = selectedRun.results.map((r) => {
+      const tc = r.test_case;
+      const assertionsStr = tc?.assertions
+        ? parseAssertions(tc.assertions).map(formatAssertion).join(' ; ')
+        : '';
+      return [
+        tc?.name ?? r.test_case_id.slice(0, 8),
+        tc?.input_text ?? '',
+        assertionsStr,
+        r.actual_output ?? '',
+      ];
+    });
+
+    const safeName = selectedRun.name.replace(/[^a-z0-9-_]+/gi, '_').slice(0, 60);
+    const date = new Date().toISOString().slice(0, 10);
+    downloadXlsx(
+      `backtest-${safeName}-${date}.xlsx`,
+      'Results',
+      headers,
+      rows,
+    );
+  }
+
+  /**
+   * Jump to a test case from the backtest results modal: close the modal,
+   * expand the case, and scroll it into view.
+   */
+  function jumpToTestCase(testCaseId: string) {
+    setSelectedRun(null);
+    setExpandedCaseId(testCaseId);
+    // Defer scroll so React has time to expand the card. Use block:'start' so the
+    // title is visible — expanded cards can be tall enough that 'center' pushes
+    // the title above the viewport.
+    setTimeout(() => {
+      const el = document.getElementById(`test-case-${testCaseId}`);
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }
+    }, 100);
+  }
+
+  /** Open the Add-to-SFT modal pre-loaded with the given test cases. */
+  function openAddTestCasesToDataset(cases: TestCase[]) {
+    if (cases.length === 0) return;
+    const items: AddToDatasetItem[] = cases.map((tc) => ({
+      input_text: tc.input_text,
+      output_text: tc.expected_output,
+      label: tc.name,
+    }));
+    setAddToDatasetItems(items);
+    setAddToDatasetTitle(
+      cases.length === 1
+        ? `Add Test Case "${cases[0].name}" to SFT Dataset`
+        : `Add ${cases.length} Test Cases to SFT Dataset`,
+    );
+    setAddToDatasetDefaults({});
+    setShowAddToDataset(true);
+  }
+
+  /**
+   * Open the Add-to-SFT modal pre-loaded with a backtest result.
+   * `useExpected` chooses which output becomes the SFT target:
+   *   - true  → expected_output (typical: lock in the desired answer)
+   *   - false → actual_output   (distillation: capture teacher model's output)
+   */
+  function openAddBacktestResultToDataset(
+    result: BacktestResult,
+    useExpected: boolean,
+  ) {
+    const inputText = result.test_case?.input_text ?? '';
+    const outputText = useExpected
+      ? result.test_case?.expected_output ?? ''
+      : result.actual_output ?? '';
+
+    if (!outputText) {
+      alert(
+        useExpected
+          ? 'No expected output available for this test case.'
+          : 'No actual output available — the run may still be in progress.',
+      );
+      return;
+    }
+
+    // Pre-fill instruction/system_message from the backtest run's prompt version
+    let defaultInstruction = '';
+    let defaultSystemMessage = '';
+    if (selectedRun) {
+      for (const p of prompts) {
+        const v = p.versions.find((v) => v.id === selectedRun.prompt_version_id);
+        if (v) {
+          defaultInstruction = v.content || '';
+          defaultSystemMessage = v.system_message || '';
+          break;
+        }
+      }
+    }
+
+    setAddToDatasetItems([
+      {
+        input_text: inputText,
+        output_text: outputText,
+        label: `${result.test_case?.name ?? result.test_case_id.slice(0, 8)} — ${
+          useExpected ? 'expected' : 'actual'
+        } output`,
+      },
+    ]);
+    setAddToDatasetTitle(
+      useExpected
+        ? 'Add Backtest Result (Expected Output) to SFT Dataset'
+        : 'Add Backtest Result (Actual Output) to SFT Dataset',
+    );
+    setAddToDatasetDefaults({
+      instruction: defaultInstruction,
+      systemMessage: defaultSystemMessage,
+    });
+    setShowAddToDataset(true);
+  }
+
   async function saveAssertions(
     tcId: string,
     assertions: AssertionSpec[],
@@ -566,6 +895,37 @@ export function BacktestPanel({ projectId }: Props) {
     }
   }
 
+  /**
+   * One-click re-run: clones the existing run's parameters (prompt + model +
+   * threshold + judge) so the user doesn't have to refill the form. Auto-names
+   * the new run "<original> (rerun N)" so successive clicks produce distinct
+   * names instead of colliding.
+   */
+  async function handleRerun(run: BacktestRun) {
+    setLoading(true);
+    try {
+      // Strip any existing "(rerun N)" suffix so we don't end up with
+      // "Foo (rerun 1) (rerun 1)".
+      const baseName = run.name.replace(/\s*\(rerun\s*\d*\)\s*$/, '');
+      const existingRerunCount = backtestRuns.filter((r) =>
+        r.name.startsWith(baseName + ' (rerun'),
+      ).length;
+      const newName = `${baseName} (rerun ${existingRerunCount + 1})`;
+
+      await postTrainingApi.createBacktestRun(projectId, {
+        name: newName,
+        prompt_version_id: run.prompt_version_id,
+        model_config_id: run.model_config_id,
+        pass_threshold: run.pass_threshold,
+        judge_model_config_id: run.judge_model_config_id || undefined,
+      });
+      await loadData();
+    } catch (e) {
+      alert(`Re-run failed: ${(e as Error).message}`);
+    }
+    setLoading(false);
+  }
+
   async function handleCreateRun() {
     if (!runName.trim() || !runPromptVersionId || !runModelConfigId) return;
     setLoading(true);
@@ -583,8 +943,8 @@ export function BacktestPanel({ projectId }: Props) {
       setRunPassThreshold(0.5);
       setShowRunModal(false);
       await loadData();
-    } catch {
-      // silently fail
+    } catch (e) {
+      alert(`Failed to create backtest: ${(e as Error).message}`);
     }
     setLoading(false);
   }
@@ -627,8 +987,32 @@ export function BacktestPanel({ projectId }: Props) {
               </CheckboxRow>
             )}
             {selectedCaseIds.size > 0 && (
-              <Button size="sm" variant="danger" onClick={handleBulkDeleteCases}>
-                Delete ({selectedCaseIds.size})
+              <>
+                <Button
+                  size="sm"
+                  onClick={() =>
+                    openAddTestCasesToDataset(
+                      testCases.filter((t) => selectedCaseIds.has(t.id)),
+                    )
+                  }
+                >
+                  + Add to SFT ({selectedCaseIds.size})
+                </Button>
+                <Button size="sm" variant="danger" onClick={handleBulkDeleteCases}>
+                  Delete ({selectedCaseIds.size})
+                </Button>
+              </>
+            )}
+            {testCases.length > 0 && testCases.some((t) => t.pii_status === 'unchecked') && (
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={handleMaskPii}
+                title="Run PII detection on every unchecked test case"
+              >
+                Mask PII (
+                {testCases.filter((t) => t.pii_status === 'unchecked').length}
+                )
               </Button>
             )}
             <Button size="sm" onClick={() => setShowCaseForm((v) => !v)}>
@@ -699,6 +1083,7 @@ export function BacktestPanel({ projectId }: Props) {
             return (
               <Card
                 key={tc.id}
+                id={`test-case-${tc.id}`}
                 $selected={isExpanded}
                 onClick={() => setExpandedCaseId(isExpanded ? null : tc.id)}
               >
@@ -718,6 +1103,33 @@ export function BacktestPanel({ projectId }: Props) {
                   <Row style={{ gap: 6 }}>
                     {tc.is_golden && <Badge color="warning">Golden</Badge>}
                     <Badge color="secondary">{tc.expected_type}</Badge>
+                    {tc.pii_status === 'masked' && (
+                      <Badge
+                        color="success"
+                        title="PII detected and masked"
+                        style={{ padding: '1px 6px', fontSize: '0.6rem', letterSpacing: '0.3px' }}
+                      >
+                        PII masked
+                      </Badge>
+                    )}
+                    {tc.pii_status === 'clean' && (
+                      <Badge
+                        color="success"
+                        title="PII check ran, no PII detected"
+                        style={{ padding: '1px 6px', fontSize: '0.6rem', letterSpacing: '0.3px' }}
+                      >
+                        PII clean
+                      </Badge>
+                    )}
+                    {tc.pii_status === 'unchecked' && (
+                      <Badge
+                        color="warning"
+                        title="PII detection has not been run on this test case"
+                        style={{ padding: '1px 6px', fontSize: '0.6rem', letterSpacing: '0.3px' }}
+                      >
+                        PII unchecked
+                      </Badge>
+                    )}
                     {parseAssertions(tc.assertions).length > 0 && (
                       <Badge color="primary">{parseAssertions(tc.assertions).length} assertions</Badge>
                     )}
@@ -739,7 +1151,19 @@ export function BacktestPanel({ projectId }: Props) {
                   <DetailSection onClick={(e) => e.stopPropagation()}>
                     <DetailRow>
                       <DetailField>
-                        <DetailLabel>Input Text</DetailLabel>
+                        <DetailFieldHeader>
+                          <DetailLabel>Input Text</DetailLabel>
+                          <CopyButton
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              copyInputToClipboard(tc);
+                            }}
+                            title="Copy input text to clipboard"
+                          >
+                            {copiedCaseId === tc.id ? '✓ Copied' : 'Copy'}
+                          </CopyButton>
+                        </DetailFieldHeader>
                         <DetailValue>{tc.input_text}</DetailValue>
                       </DetailField>
                       <DetailField>
@@ -775,6 +1199,13 @@ export function BacktestPanel({ projectId }: Props) {
                       )}
                     </CardMeta>
                     <DetailActions>
+                      <Button
+                        size="sm"
+                        onClick={() => openAddTestCasesToDataset([tc])}
+                        style={{ fontSize: '0.75rem' }}
+                      >
+                        + Add to SFT Dataset
+                      </Button>
                       <Button
                         size="sm"
                         variant="danger"
@@ -813,6 +1244,18 @@ export function BacktestPanel({ projectId }: Props) {
                 <CardTitle>{run.name}</CardTitle>
                 <Row style={{ gap: 6 }}>
                   <Badge color={getRunBadgeColor(run.status)}>{run.status}</Badge>
+                  {run.status === 'completed' && (
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={(e) => { e.stopPropagation(); handleRerun(run); }}
+                      disabled={loading}
+                      title="Re-run with the same prompt, model, and test cases"
+                      style={{ padding: '2px 8px', fontSize: '0.72rem' }}
+                    >
+                      ↻ Re-run
+                    </Button>
+                  )}
                   <Button
                     size="sm"
                     variant="ghost"
@@ -938,6 +1381,15 @@ export function BacktestPanel({ projectId }: Props) {
               <ModalTitle>{selectedRun.name}</ModalTitle>
               <Row>
                 <Badge color={getRunBadgeColor(selectedRun.status)}>{selectedRun.status}</Badge>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={handleExportBacktestXlsx}
+                  disabled={selectedRun.results.length === 0}
+                  title="Export results as Excel (.xlsx)"
+                >
+                  Export Excel
+                </Button>
                 <Button size="sm" variant="ghost" onClick={() => setSelectedRun(null)}>Close</Button>
               </Row>
             </ModalHeader>
@@ -979,7 +1431,21 @@ export function BacktestPanel({ projectId }: Props) {
                   {selectedRun.results.map((r) => (
                     <React.Fragment key={r.id}>
                       <tr>
-                        <Td>{r.test_case?.name ?? r.test_case_id.slice(0, 8)}</Td>
+                        <Td>
+                          {r.test_case ? (
+                            <TestCaseLink
+                              type="button"
+                              onClick={() => jumpToTestCase(r.test_case!.id)}
+                              title="Open this test case"
+                            >
+                              {r.test_case.name}
+                            </TestCaseLink>
+                          ) : (
+                            <span style={{ color: tokens.colors.text.muted }}>
+                              {r.test_case_id.slice(0, 8)} (deleted)
+                            </span>
+                          )}
+                        </Td>
                         <Td>
                           <Badge color={getStatusColor(r.status)}>{r.status}</Badge>
                         </Td>
@@ -1022,12 +1488,32 @@ export function BacktestPanel({ projectId }: Props) {
                                 <DiffBox $type="expected">
                                   {r.test_case?.expected_output ?? '—'}
                                 </DiffBox>
+                                {r.test_case?.expected_output && (
+                                  <Button
+                                    size="sm"
+                                    variant="ghost"
+                                    onClick={() => openAddBacktestResultToDataset(r, true)}
+                                    style={{ marginTop: 6, fontSize: '0.72rem' }}
+                                  >
+                                    + Add Expected to SFT
+                                  </Button>
+                                )}
                               </div>
                               <div>
                                 <DiffLabel>Actual</DiffLabel>
                                 <DiffBox $type="actual">
                                   {r.actual_output ?? '(no output)'}
                                 </DiffBox>
+                                {r.actual_output && (
+                                  <Button
+                                    size="sm"
+                                    variant="ghost"
+                                    onClick={() => openAddBacktestResultToDataset(r, false)}
+                                    style={{ marginTop: 6, fontSize: '0.72rem' }}
+                                  >
+                                    + Add Actual to SFT (distill)
+                                  </Button>
+                                )}
                               </div>
                             </DiffSection>
                           </Td>
@@ -1045,6 +1531,16 @@ export function BacktestPanel({ projectId }: Props) {
           </Modal>
         </ModalOverlay>
       )}
+
+      <AddToDatasetModal
+        open={showAddToDataset}
+        onClose={() => setShowAddToDataset(false)}
+        projectId={projectId}
+        items={addToDatasetItems}
+        title={addToDatasetTitle}
+        defaultInstruction={addToDatasetDefaults.instruction}
+        defaultSystemMessage={addToDatasetDefaults.systemMessage}
+      />
     </Layout>
   );
 }

@@ -8,7 +8,7 @@
  * Lives on its own tables (pt_comparison_runs / _children / _results /
  * _input_items) — does not touch BacktestRun / TestCase.
  */
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useParams } from 'react-router-dom';
 import styled from 'styled-components';
 import { tokens } from '../theme/tokens';
@@ -282,6 +282,124 @@ const FilterBar = styled.div`
   font-size: 0.8rem;
 `;
 
+/* ─── Full Row Expansion Modal ───────────────────────────────────────────── */
+
+const FullRowOverlay = styled.div`
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.65);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 150;
+`;
+
+const FullRowModal = styled.div`
+  background: ${tokens.colors.bg.secondary};
+  border: 1px solid ${tokens.colors.border.subtle};
+  border-radius: ${tokens.radii.md};
+  width: 90vw;
+  max-width: 1400px;
+  max-height: 85vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+`;
+
+const FullRowHead = styled.div`
+  padding: 12px 16px;
+  border-bottom: 1px solid ${tokens.colors.border.subtle};
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+`;
+
+const FullRowHeadTitle = styled.div`
+  font-family: ${tokens.fonts.accent};
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: ${tokens.colors.text.muted};
+`;
+
+const FullRowBody = styled.div`
+  padding: ${tokens.spacing.md};
+  overflow: auto;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: ${tokens.spacing.md};
+`;
+
+const FullRowInput = styled.pre`
+  background: ${tokens.colors.bg.primary};
+  border: 1px solid ${tokens.colors.border.subtle};
+  border-radius: ${tokens.radii.sm};
+  padding: 12px;
+  font-family: ${tokens.fonts.mono};
+  font-size: 0.8rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: ${tokens.colors.text.primary};
+  margin: 0;
+  max-height: 150px;
+  overflow-y: auto;
+`;
+
+const FullRowGrid = styled.div`
+  display: flex;
+  gap: ${tokens.spacing.md};
+  overflow-x: auto;
+  padding-bottom: 8px;
+`;
+
+const FullRowCell = styled.div`
+  flex: 0 0 minmax(300px, 1fr);
+  border: 1px solid ${tokens.colors.border.subtle};
+  border-radius: ${tokens.radii.sm};
+  background: ${tokens.colors.bg.primary};
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+`;
+
+const FullRowCellHead = styled.div`
+  padding: 10px 12px;
+  background: ${tokens.colors.bg.secondary};
+  border-bottom: 1px solid ${tokens.colors.border.subtle};
+  font-weight: 600;
+  font-size: 0.8rem;
+  color: ${tokens.colors.text.primary};
+`;
+
+const FullRowCellBody = styled.div`
+  padding: 10px 12px;
+  flex: 1;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+`;
+
+const FullRowCellOutput = styled.pre`
+  background: ${tokens.colors.bg.primary};
+  border: 1px solid ${tokens.colors.border.subtle};
+  border-radius: ${tokens.radii.sm};
+  padding: 8px;
+  font-family: ${tokens.fonts.mono};
+  font-size: 0.7rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: ${tokens.colors.text.primary};
+  margin: 0;
+  max-height: 300px;
+  overflow-y: auto;
+  flex: 1;
+`;
+
 /* ─── Helpers ────────────────────────────────────────────────────────────── */
 
 // Reasoning models (Qwen3, DeepSeek-R1, etc.) emit <think>…</think> blocks
@@ -338,6 +456,31 @@ function inputPreview(text: string, max = 80): string {
   return t.length > max ? `${t.slice(0, max)}…` : t;
 }
 
+// CSV escape: wrap in quotes if value contains comma, quote, or newline.
+// Inner quotes are doubled per RFC 4180.
+function csvCell(value: string | number | null | undefined): string {
+  if (value == null) return '';
+  const s = String(value);
+  if (/[",\r\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+  return s;
+}
+
+function downloadBlob(filename: string, content: string, mime: string) {
+  const blob = new Blob([content], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function safeFilename(name: string): string {
+  return (name || 'comparison').replace(/[^\w\-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 80) || 'comparison';
+}
+
 /* ─── Page ───────────────────────────────────────────────────────────────── */
 
 export function BatchComparePage() {
@@ -352,6 +495,26 @@ export function BatchComparePage() {
   const [showModal, setShowModal] = useState(false);
   const [expandedCellKey, setExpandedCellKey] = useState<string | null>(null);
   const [showOnlyFailures, setShowOnlyFailures] = useState(false);
+  const [scrollLock, setScrollLock] = useState(false);
+  const [expandedRowId, setExpandedRowId] = useState<string | null>(null);
+  const [fullRowScrollLock, setFullRowScrollLock] = useState(false);
+  const [expandFullRowData, setExpandFullRowData] = useState<{ row: MatrixRow; cols: MatrixCol[] } | null>(null);
+  const [inputCopied, setInputCopied] = useState(false);
+  const scrollRefs = useRef<Map<string, HTMLPreElement>>(new Map());
+  const isSyncingScroll = useRef(false);
+
+  const handleSyncScroll = useCallback((rowId: string, source: HTMLPreElement) => {
+    if (!scrollLock) return;
+    if (isSyncingScroll.current) return;
+    isSyncingScroll.current = true;
+    const top = source.scrollTop;
+    scrollRefs.current.forEach((el, key) => {
+      if (el === source) return;
+      if (!key.startsWith(`${rowId}:`)) return;
+      if (el.scrollTop !== top) el.scrollTop = top;
+    });
+    requestAnimationFrame(() => { isSyncingScroll.current = false; });
+  }, [scrollLock]);
 
   // Add-to-dataset state
   const [addTarget, setAddTarget] = useState<AddToDatasetTarget | null>(null);
@@ -360,6 +523,19 @@ export function BatchComparePage() {
   const [newDatasetName, setNewDatasetName] = useState<string>('');
   const [savingToDataset, setSavingToDataset] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState(false);
+
+  // Add-to-backtest state — saves a (input, expected_output) pair as a TestCase
+  // in Post-Training → Backtesting. Mirrors Workspace's "Save as Test Case".
+  const [backtestTarget, setBacktestTarget] = useState<AddToDatasetTarget | null>(null);
+  const [tcName, setTcName] = useState('');
+  const [tcExpectedOutput, setTcExpectedOutput] = useState('');
+  const [tcExpectedType, setTcExpectedType] = useState('classification');
+  const [tcTags, setTcTags] = useState('');
+  const [tcNotes, setTcNotes] = useState('');
+  const [tcIsGolden, setTcIsGolden] = useState(false);
+  const [savingToBacktest, setSavingToBacktest] = useState(false);
+  const [backtestSaveSuccess, setBacktestSaveSuccess] = useState(false);
+  const [backtestSaveError, setBacktestSaveError] = useState<string | null>(null);
 
   // Chains available as columns. A chain runs as a single canonical column —
   // the chain's full `final_output` JSON ({node_name: text}) is the cell value.
@@ -559,6 +735,148 @@ export function BatchComparePage() {
     }
   }
 
+  function openAddToBacktest(target: AddToDatasetTarget) {
+    setBacktestTarget(target);
+    setBacktestSaveSuccess(false);
+    setBacktestSaveError(null);
+    const sourceName = target.inputItem.name?.trim();
+    setTcName(
+      sourceName
+        ? `${sourceName} – ${target.modelName}`
+        : `Test case – ${new Date().toLocaleDateString(undefined, { month: 'short', day: 'numeric' })} – ${target.modelName}`,
+    );
+    // Pre-fill the expected output with the model's actual output (think tags
+    // stripped) so the user can edit it down to the canonical answer.
+    const cleaned = target.cell.child.kind === 'chain'
+      ? prettyChainOutput(target.cell.result.actual_output)
+      : stripThinkTags(target.cell.result.actual_output);
+    setTcExpectedOutput(cleaned);
+    setTcExpectedType('classification');
+    setTcTags(`batch_compare,model:${target.modelName}`);
+    setTcNotes('');
+    setTcIsGolden(false);
+  }
+
+  async function handleSaveToBacktest() {
+    if (!projectId || !backtestTarget || !tcName.trim()) return;
+    setSavingToBacktest(true);
+    setBacktestSaveError(null);
+    try {
+      await postTrainingApi.createTestCase(projectId, {
+        name: tcName.trim(),
+        input_text: backtestTarget.inputItem.input_text,
+        expected_output: tcExpectedOutput,
+        expected_type: tcExpectedType,
+        tags: tcTags.trim() || undefined,
+        notes: tcNotes.trim() || undefined,
+        is_golden: tcIsGolden,
+      });
+      setBacktestSaveSuccess(true);
+    } catch (e) {
+      setBacktestSaveError(e instanceof Error ? e.message : 'Failed to save');
+    }
+    setSavingToBacktest(false);
+  }
+
+  function openExpandFullRow(row: MatrixRow, cols: MatrixCol[]) {
+    setExpandFullRowData({ row, cols });
+    setFullRowScrollLock(false);
+  }
+
+  function handleDownloadCsv() {
+    if (!detail) return;
+    const cols = matrix.cols;
+    const colLabels = cols.map((col) => {
+      if (col.kind === 'chain') {
+        return chains.find((c) => c.id === col.id)?.name ?? `chain:${col.id.slice(0, 8)}`;
+      }
+      return models.find((m) => m.id === col.id)?.name ?? `model:${col.id.slice(0, 8)}`;
+    });
+
+    const headers = ['#', 'input_name', 'input_text', ...colLabels];
+
+    const lines: string[] = [headers.map(csvCell).join(',')];
+    matrix.rows.forEach((row, idx) => {
+      const cells: (string | number | null)[] = [
+        idx + 1,
+        row.inputItem.name ?? '',
+        row.inputItem.input_text ?? '',
+      ];
+      cols.forEach((col, colIdx) => {
+        const cell = row.cells[colIdx];
+        if (!cell) {
+          cells.push('');
+          return;
+        }
+        const output = col.kind === 'chain'
+          ? prettyChainOutput(cell.result.actual_output)
+          : stripThinkTags(cell.result.actual_output);
+        cells.push(output);
+      });
+      lines.push(cells.map(csvCell).join(','));
+    });
+
+    const date = new Date().toISOString().slice(0, 10);
+    downloadBlob(`${safeFilename(detail.name)}-${date}.csv`, lines.join('\r\n'), 'text/csv;charset=utf-8');
+  }
+
+  async function handleClone(runId: string) {
+    if (!projectId) return;
+    try {
+      const full = await postTrainingApi.getComparisonRun(projectId, runId);
+      // Form fields derivable directly from the run
+      setName(`${full.name} (clone)`);
+      setPromptVersionId(full.prompt_version_id ?? '');
+      setJudgeModelId(full.judge_model_config_id ?? '');
+
+      // Models and chains: split children by kind
+      const modelIds = new Set<string>();
+      const chainIds = new Set<string>();
+      const overrides: Record<string, string> = {};
+      for (const child of full.children) {
+        if (child.kind === 'model' && child.model_config_id) {
+          modelIds.add(child.model_config_id);
+          // A child whose prompt diverges from the parent's was an override
+          if (child.prompt_version_id && child.prompt_version_id !== full.prompt_version_id) {
+            overrides[child.model_config_id] = child.prompt_version_id;
+          }
+        } else if (child.kind === 'chain' && child.chain_id) {
+          chainIds.add(child.chain_id);
+        }
+      }
+      setSelectedModelIds(modelIds);
+      setSelectedChainIds(chainIds);
+      setPromptOverrides(overrides);
+
+      // Resolve the input dataset by looking up any source item id across known
+      // datasets. If the source dataset was deleted we just leave it blank.
+      const sourceItemIds = full.input_items
+        .map((it) => it.source_input_dataset_item_id)
+        .filter((x): x is string => !!x);
+      setInputDatasetId('');
+      setDatasetItems([]);
+      setSelectedItemIds(new Set());
+      if (sourceItemIds.length > 0 && inputDatasets.length > 0) {
+        const wanted = new Set(sourceItemIds);
+        for (const ds of inputDatasets) {
+          try {
+            const items = await inputDatasetsApi.listItems(ds.id);
+            if (items.some((it) => wanted.has(it.id))) {
+              setInputDatasetId(ds.id);
+              setDatasetItems(items);
+              setSelectedItemIds(new Set(items.filter((it) => wanted.has(it.id)).map((it) => it.id)));
+              break;
+            }
+          } catch { /* ignore and try next */ }
+        }
+      }
+
+      setShowModal(true);
+    } catch (e) {
+      alert((e as Error).message);
+    }
+  }
+
   async function handleSaveToDataset() {
     if (!projectId || !addTarget) return;
     setSavingToDataset(true);
@@ -687,6 +1005,15 @@ export function BatchComparePage() {
                     <Button
                       size="sm"
                       variant="ghost"
+                      title="Clone — open New Comparison with this run's settings"
+                      onClick={(e) => { e.stopPropagation(); handleClone(r.id); }}
+                      style={{ fontSize: '0.8rem', padding: '4px 10px', color: tokens.colors.accent.primary }}
+                    >
+                      ⎘ Clone
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="ghost"
                       onClick={(e) => { e.stopPropagation(); handleDelete(r.id); }}
                       style={{ color: tokens.colors.accent.error, fontSize: '0.75rem' }}
                     >
@@ -723,16 +1050,28 @@ export function BatchComparePage() {
               >
                 {detail.status}
               </span>
-              {(detail.status === 'running' || detail.status === 'pending') && (
-                <Button size="sm" variant="danger" onClick={handleStop} style={{ marginLeft: 'auto' }}>
-                  Stop
-                </Button>
-              )}
-              {detail.status === 'cancelling' && (
-                <Button size="sm" variant="ghost" disabled style={{ marginLeft: 'auto' }}>
-                  Stopping…
-                </Button>
-              )}
+              <div style={{ marginLeft: 'auto', display: 'flex', gap: 8, alignItems: 'center' }}>
+                {matrix.rows.length > 0 && (
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={handleDownloadCsv}
+                    title="Download comparison results as CSV"
+                  >
+                    ↓ CSV
+                  </Button>
+                )}
+                {(detail.status === 'running' || detail.status === 'pending') && (
+                  <Button size="sm" variant="danger" onClick={handleStop}>
+                    Stop
+                  </Button>
+                )}
+                {detail.status === 'cancelling' && (
+                  <Button size="sm" variant="ghost" disabled>
+                    Stopping…
+                  </Button>
+                )}
+              </div>
             </div>
           )}
           {selectedId && detail && matrix.rows.length === 0 && <Empty>No inputs or no results yet.</Empty>}
@@ -745,6 +1084,17 @@ export function BatchComparePage() {
                     checked={showOnlyFailures}
                     onChange={(e) => setShowOnlyFailures(e.target.checked)}
                   /> Only rows with failures
+                </label>
+                <label title="Expand a whole row at once and sync scroll across its cells">
+                  <input
+                    type="checkbox"
+                    checked={scrollLock}
+                    onChange={(e) => {
+                      setScrollLock(e.target.checked);
+                      setExpandedCellKey(null);
+                      setExpandedRowId(null);
+                    }}
+                  /> Scroll lock
                 </label>
                 <div style={{ marginLeft: 'auto', color: tokens.colors.text.muted }}>
                   {filteredRows.length} / {matrix.rows.length} rows
@@ -849,18 +1199,33 @@ export function BatchComparePage() {
                   {filteredRows.map((row, rowIdx) => (
                     <tr key={row.inputItem.id}>
                       <Td>
-                        <div style={{ fontWeight: 500 }}>
-                          {row.inputItem.name || `#${rowIdx + 1}`}
-                        </div>
-                        {row.inputItem.name && (
-                          <Muted style={{ marginTop: 2 }}>#{rowIdx + 1}</Muted>
-                        )}
+                        <Row style={{ marginBottom: 8 }}>
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div style={{ fontWeight: 500 }}>
+                              {row.inputItem.name || `#${rowIdx + 1}`}
+                            </div>
+                            {row.inputItem.name && (
+                              <Muted style={{ marginTop: 2 }}>#{rowIdx + 1}</Muted>
+                            )}
+                          </div>
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            title="Expand full row comparison"
+                            style={{ padding: '4px 8px', fontSize: '0.7rem', flexShrink: 0 }}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              openExpandFullRow(row, matrix.cols);
+                            }}
+                          >
+                            ↗
+                          </Button>
+                        </Row>
                         <Muted style={{
                           color: tokens.colors.text.primary,
                           whiteSpace: 'pre-wrap',
                           wordBreak: 'break-word',
                           fontFamily: tokens.fonts.mono,
-                          marginTop: 4,
                         }}>
                           {inputPreview(row.inputItem.input_text, 160)}
                         </Muted>
@@ -869,7 +1234,9 @@ export function BatchComparePage() {
                         const col = matrix.cols[colIdx];
                         const colKey = `${col.kind}:${col.id}`;
                         const cellKey = `${row.inputItem.id}:${colKey}`;
-                        const isExpanded = expandedCellKey === cellKey;
+                        const isExpanded = scrollLock
+                          ? expandedRowId === row.inputItem.id
+                          : expandedCellKey === cellKey;
                         if (!cell) {
                           return <Td key={colKey}><Muted>—</Muted></Td>;
                         }
@@ -891,7 +1258,13 @@ export function BatchComparePage() {
                           <Td
                             key={colKey}
                             $fail={isFailed}
-                            onClick={() => setExpandedCellKey(isExpanded ? null : cellKey)}
+                            onClick={() => {
+                              if (scrollLock) {
+                                setExpandedRowId(isExpanded ? null : row.inputItem.id);
+                              } else {
+                                setExpandedCellKey(isExpanded ? null : cellKey);
+                              }
+                            }}
                             style={{ cursor: 'pointer' }}
                           >
                             <Row>
@@ -908,18 +1281,32 @@ export function BatchComparePage() {
                                 {cell.result.cache_hit && <span title="From cache">⚡</span>}
                                 {cell.result.latency_ms != null && <span>{cell.result.latency_ms}ms</span>}
                                 {cell.result.actual_output && (
-                                  <Button
-                                    size="sm"
-                                    variant="ghost"
-                                    title="Add this output to a Fine-Tuning dataset"
-                                    style={{ padding: '1px 6px', fontSize: '0.65rem', opacity: 0.7 }}
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      openAddToDataset({ inputItem: row.inputItem, cell, modelName });
-                                    }}
-                                  >
-                                    + Dataset
-                                  </Button>
+                                  <>
+                                    <Button
+                                      size="sm"
+                                      variant="ghost"
+                                      title="Add this output to a Fine-Tuning (SFT) dataset"
+                                      style={{ padding: '1px 6px', fontSize: '0.65rem', opacity: 0.7 }}
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        openAddToDataset({ inputItem: row.inputItem, cell, modelName });
+                                      }}
+                                    >
+                                      + SFT Dataset
+                                    </Button>
+                                    <Button
+                                      size="sm"
+                                      variant="ghost"
+                                      title="Save this input/output as a Backtest test case"
+                                      style={{ padding: '1px 6px', fontSize: '0.65rem', opacity: 0.7 }}
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        openAddToBacktest({ inputItem: row.inputItem, cell, modelName });
+                                      }}
+                                    >
+                                      + Backtest
+                                    </Button>
+                                  </>
                                 )}
                               </div>
                             </Row>
@@ -937,20 +1324,37 @@ export function BatchComparePage() {
                                 {cleanedOutput.length > 180 && '…'}
                               </Muted>
                             )}
+                            {!cleanedOutput && !isPending && !isFailed && !isCancelled && (
+                              <Muted style={{
+                                marginTop: 4,
+                                color: tokens.colors.accent.warning,
+                                fontStyle: 'italic',
+                                whiteSpace: 'normal',
+                              }}>
+                                ⚠ Empty output. Likely max_tokens reached during reasoning. Try a larger max_tokens, or add "detailed thinking off" to the system prompt.
+                              </Muted>
+                            )}
 
                             {isExpanded && (
-                              <div style={{ marginTop: 8 }}>
-                                <pre style={{
-                                  whiteSpace: 'pre-wrap',
-                                  wordBreak: 'break-word',
-                                  background: tokens.colors.bg.primary,
-                                  padding: 8,
-                                  borderRadius: 4,
-                                  maxHeight: 300,
-                                  overflow: 'auto',
-                                  fontSize: '0.7rem',
-                                  margin: 0,
-                                }}>
+                              <div style={{ marginTop: 8 }} onClick={(e) => e.stopPropagation()}>
+                                <pre
+                                  ref={(el) => {
+                                    if (el) scrollRefs.current.set(cellKey, el);
+                                    else scrollRefs.current.delete(cellKey);
+                                  }}
+                                  onScroll={(e) => handleSyncScroll(row.inputItem.id, e.currentTarget)}
+                                  style={{
+                                    whiteSpace: 'pre-wrap',
+                                    wordBreak: 'break-word',
+                                    background: tokens.colors.bg.primary,
+                                    padding: 8,
+                                    borderRadius: 4,
+                                    maxHeight: 300,
+                                    overflow: 'auto',
+                                    fontSize: '0.7rem',
+                                    margin: 0,
+                                  }}
+                                >
                                   {cleanedOutput || '(no output)'}
                                 </pre>
                                 {cell.result.error_message && (
@@ -972,12 +1376,12 @@ export function BatchComparePage() {
         </RightPane>
       </Page>
 
-      {/* ── Add to Fine-Tuning Dataset dialog ── */}
+      {/* ── Add to SFT (Fine-Tuning) Dataset dialog ── */}
       {addTarget && (
         <DialogOverlay onClick={() => setAddTarget(null)}>
           <Dialog onClick={(e) => e.stopPropagation()}>
             <ModalHead>
-              <PaneTitle>Add to Fine-Tuning Dataset</PaneTitle>
+              <PaneTitle>Add to SFT Dataset</PaneTitle>
               <Button size="sm" variant="ghost" onClick={() => setAddTarget(null)}>Close</Button>
             </ModalHead>
             <ModalBody>
@@ -1034,6 +1438,288 @@ export function BatchComparePage() {
             </ModalBody>
           </Dialog>
         </DialogOverlay>
+      )}
+
+      {/* ── Add to Backtest (Test Case) dialog ── */}
+      {backtestTarget && (
+        <DialogOverlay onClick={() => setBacktestTarget(null)}>
+          <Dialog onClick={(e) => e.stopPropagation()}>
+            <ModalHead>
+              <PaneTitle>Save as Backtest Test Case</PaneTitle>
+              <Button size="sm" variant="ghost" onClick={() => setBacktestTarget(null)}>Close</Button>
+            </ModalHead>
+            <ModalBody>
+              {backtestSaveSuccess ? (
+                <div style={{ textAlign: 'center', padding: '16px 0', color: tokens.colors.accent.success }}>
+                  ✓ Test case saved to Post-Training → Backtesting{' '}
+                  <Button size="sm" variant="ghost" onClick={() => setBacktestTarget(null)}>Close</Button>
+                </div>
+              ) : (
+                <>
+                  <FormGroup>
+                    <Label>Name</Label>
+                    <Input
+                      value={tcName}
+                      onChange={(e) => setTcName(e.target.value)}
+                      placeholder="Describe what this test case validates"
+                    />
+                  </FormGroup>
+
+                  <FormGroup>
+                    <Label>Input</Label>
+                    <PreviewBox>{backtestTarget.inputItem.input_text}</PreviewBox>
+                  </FormGroup>
+
+                  <FormGroup>
+                    <Label>Expected Output ({backtestTarget.modelName}) — edit if needed</Label>
+                    <textarea
+                      value={tcExpectedOutput}
+                      onChange={(e) => setTcExpectedOutput(e.target.value)}
+                      style={{
+                        width: '100%',
+                        minHeight: 100,
+                        maxHeight: 220,
+                        background: tokens.colors.bg.tertiary,
+                        border: `1px solid ${tokens.colors.border.subtle}`,
+                        borderRadius: tokens.radii.sm,
+                        color: tokens.colors.text.primary,
+                        padding: '8px 10px',
+                        fontFamily: tokens.fonts.mono,
+                        fontSize: '0.78rem',
+                        outline: 'none',
+                        resize: 'vertical',
+                        boxSizing: 'border-box',
+                      }}
+                    />
+                  </FormGroup>
+
+                  <FormGroup>
+                    <Label>Expected Output Type</Label>
+                    <Select value={tcExpectedType} onChange={(e) => setTcExpectedType(e.target.value)}>
+                      <option value="generative">Generative</option>
+                      <option value="classification">Classification</option>
+                      <option value="extraction">Extraction</option>
+                      <option value="structured">Structured</option>
+                    </Select>
+                  </FormGroup>
+
+                  <FormGroup>
+                    <Label>Tags (comma-separated)</Label>
+                    <Input
+                      value={tcTags}
+                      onChange={(e) => setTcTags(e.target.value)}
+                      placeholder="e.g. ocr, medical, v2-prompt"
+                    />
+                  </FormGroup>
+
+                  <FormGroup>
+                    <Label>Notes (optional)</Label>
+                    <textarea
+                      value={tcNotes}
+                      onChange={(e) => setTcNotes(e.target.value)}
+                      placeholder="Why is this output good? What should the model preserve?"
+                      style={{
+                        width: '100%',
+                        minHeight: 60,
+                        background: tokens.colors.bg.tertiary,
+                        border: `1px solid ${tokens.colors.border.subtle}`,
+                        borderRadius: tokens.radii.sm,
+                        color: tokens.colors.text.primary,
+                        padding: '8px 10px',
+                        fontFamily: tokens.fonts.body,
+                        fontSize: '0.82rem',
+                        outline: 'none',
+                        resize: 'vertical',
+                        boxSizing: 'border-box',
+                      }}
+                    />
+                  </FormGroup>
+
+                  <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '0.82rem', color: tokens.colors.text.secondary, cursor: 'pointer' }}>
+                    <input
+                      type="checkbox"
+                      checked={tcIsGolden}
+                      onChange={(e) => setTcIsGolden(e.target.checked)}
+                      style={{ accentColor: tokens.colors.accent.primary }}
+                    />
+                    Mark as golden dataset entry (high-confidence ground truth)
+                  </label>
+
+                  {backtestSaveError && (
+                    <div style={{ fontSize: '0.8rem', color: tokens.colors.accent.error }}>
+                      Error: {backtestSaveError}
+                    </div>
+                  )}
+
+                  <Button
+                    disabled={savingToBacktest || !tcName.trim()}
+                    onClick={handleSaveToBacktest}
+                  >
+                    {savingToBacktest ? 'Saving…' : 'Save Test Case'}
+                  </Button>
+                </>
+              )}
+            </ModalBody>
+          </Dialog>
+        </DialogOverlay>
+      )}
+
+      {expandFullRowData && (
+        <FullRowOverlay onClick={() => setExpandFullRowData(null)}>
+          <FullRowModal onClick={(e) => e.stopPropagation()}>
+            <FullRowHead>
+              <FullRowHeadTitle>Expand Comparison</FullRowHeadTitle>
+              <div style={{ display: 'flex', gap: 12, alignItems: 'center', marginLeft: 'auto' }}>
+                <label title="Sync scroll across all outputs">
+                  <input
+                    type="checkbox"
+                    checked={fullRowScrollLock}
+                    onChange={(e) => setFullRowScrollLock(e.target.checked)}
+                  /> Scroll lock
+                </label>
+                <Button size="sm" variant="ghost" onClick={() => setExpandFullRowData(null)}>Close</Button>
+              </div>
+            </FullRowHead>
+            <FullRowBody>
+              <div>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8, gap: 12 }}>
+                  <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, minWidth: 0 }}>
+                    <Label style={{ marginBottom: 0 }}>Input</Label>
+                    {expandFullRowData.row.inputItem.name && (
+                      <span
+                        title={expandFullRowData.row.inputItem.name}
+                        style={{
+                          fontFamily: tokens.fonts.mono,
+                          fontSize: '0.78rem',
+                          color: tokens.colors.text.primary,
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                          whiteSpace: 'nowrap',
+                        }}
+                      >
+                        {expandFullRowData.row.inputItem.name}
+                      </span>
+                    )}
+                  </div>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    title="Copy input to clipboard"
+                    style={{ fontSize: '0.7rem', padding: '2px 8px', flexShrink: 0 }}
+                    onClick={async () => {
+                      const text = expandFullRowData.row.inputItem.input_text || '';
+                      try {
+                        await navigator.clipboard.writeText(text);
+                      } catch {
+                        // Clipboard API can be blocked (insecure context, denied perm).
+                        // Fall back to a hidden textarea + execCommand.
+                        const ta = document.createElement('textarea');
+                        ta.value = text;
+                        ta.style.position = 'fixed';
+                        ta.style.opacity = '0';
+                        document.body.appendChild(ta);
+                        ta.select();
+                        try { document.execCommand('copy'); } catch { /* give up silently */ }
+                        document.body.removeChild(ta);
+                      }
+                      setInputCopied(true);
+                      setTimeout(() => setInputCopied(false), 1500);
+                    }}
+                  >
+                    {inputCopied ? '✓ Copied' : '⧉ Copy'}
+                  </Button>
+                </div>
+                <FullRowInput>{expandFullRowData.row.inputItem.input_text || '(empty)'}</FullRowInput>
+              </div>
+
+              <div>
+                <Label style={{ marginBottom: 8 }}>Outputs</Label>
+                <FullRowGrid>
+                  {expandFullRowData.cols.map((col, colIdx) => {
+                    const cell = expandFullRowData.row.cells[colIdx];
+                    const modelName = col.kind === 'chain'
+                      ? (chains.find((c) => c.id === col.id)?.name ?? col.id.slice(0, 8))
+                      : (models.find((x) => x.id === col.id)?.name ?? col.id.slice(0, 8));
+
+                    const cleanedOutput = col.kind === 'chain'
+                      ? prettyChainOutput(cell?.result.actual_output)
+                      : stripThinkTags(cell?.result.actual_output);
+
+                    const cellKey = `fullrow:${expandFullRowData.row.inputItem.id}:${col.kind}:${col.id}`;
+
+                    return (
+                      <FullRowCell key={`${col.kind}:${col.id}`}>
+                        <FullRowCellHead>
+                          <div>{modelName}</div>
+                          {col.kind === 'model' && (
+                            <Muted style={{ fontSize: '0.7rem', marginTop: 2 }}>
+                              {col.child.status}
+                            </Muted>
+                          )}
+                        </FullRowCellHead>
+                        <FullRowCellBody>
+                          {!cell ? (
+                            <Muted>—</Muted>
+                          ) : (
+                            <>
+                              <Row style={{ gap: 4, fontSize: '0.7rem' }}>
+                                {cell.result.status === 'pending' ? (
+                                  <Badge color="secondary">pending</Badge>
+                                ) : cell.result.status === 'failed' ? (
+                                  <Badge color="error">failed</Badge>
+                                ) : cell.result.status === 'cancelled' ? (
+                                  <Badge color="secondary">cancelled</Badge>
+                                ) : (
+                                  <Badge color="success">ok</Badge>
+                                )}
+                                {cell.result.cache_hit && <span title="From cache">⚡</span>}
+                                {cell.result.latency_ms != null && <span>{cell.result.latency_ms}ms</span>}
+                              </Row>
+                              {cleanedOutput && (
+                                <FullRowCellOutput
+                                  ref={(el) => {
+                                    if (el) scrollRefs.current.set(cellKey, el);
+                                    else scrollRefs.current.delete(cellKey);
+                                  }}
+                                  onScroll={(e) => {
+                                    if (!fullRowScrollLock) return;
+                                    const source = e.currentTarget;
+                                    const top = source.scrollTop;
+                                    scrollRefs.current.forEach((el, key) => {
+                                      if (!key.startsWith('fullrow:')) return;
+                                      if (el === source) return;
+                                      if (el.scrollTop !== top) el.scrollTop = top;
+                                    });
+                                  }}
+                                >
+                                  {cleanedOutput || '(no output)'}
+                                </FullRowCellOutput>
+                              )}
+                              {!cleanedOutput && cell.result.status !== 'pending' && cell.result.status !== 'failed' && cell.result.status !== 'cancelled' && (
+                                <Muted style={{
+                                  color: tokens.colors.accent.warning,
+                                  fontStyle: 'italic',
+                                  fontSize: '0.7rem',
+                                }}>
+                                  ⚠ Empty output. Likely max_tokens reached during reasoning. Try a larger max_tokens, or add "detailed thinking off" to the system prompt.
+                                </Muted>
+                              )}
+                              {cell.result.error_message && (
+                                <Muted style={{ color: tokens.colors.accent.error, fontSize: '0.7rem' }}>
+                                  Error: {cell.result.error_message}
+                                </Muted>
+                              )}
+                            </>
+                          )}
+                        </FullRowCellBody>
+                      </FullRowCell>
+                    );
+                  })}
+                </FullRowGrid>
+              </div>
+            </FullRowBody>
+          </FullRowModal>
+        </FullRowOverlay>
       )}
 
       {showModal && (

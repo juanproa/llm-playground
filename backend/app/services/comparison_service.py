@@ -137,6 +137,16 @@ async def create_comparison_run(
             raise ValueError(
                 "No items selected — this dataset is empty or none of the picked item ids matched."
             )
+        # Project policy: batch compares may only run on PII-masked data
+        # sourced from datasets. Refuse if any selected item is unmasked.
+        unmasked = [it for it in items if it.pii_status != "masked"]
+        if unmasked:
+            preview = ", ".join((it.name or it.id[:8]) for it in unmasked[:5])
+            raise ValueError(
+                f"{len(unmasked)} dataset item(s) have not been PII-masked: "
+                f"{preview}{'…' if len(unmasked) > 5 else ''}. "
+                "Mask those items in the dataset first, then retry."
+            )
         for item in items:
             # Once PII has been masked, the masked content is the only version
             # allowed to leave the dataset (see InputDatasetItem.effective_content).

@@ -75,6 +75,8 @@ export function ProjectWorkspacePage() {
   const [showComparison, setShowComparison] = useState(false);
   const [comparisonModels, setComparisonModels] = useState<[ModelConfig | null, ModelConfig | null]>([null, null]);
   const [ragOverride, setRagOverride] = useState<RagOverride>({ mode: 'prompt' });
+  const [promptBuilderEnabled, setPromptBuilderEnabled] = useState(false);
+  const [selectedHistoryRunId, setSelectedHistoryRunId] = useState<string | null>(null);
 
   // Translate the per-call RAG override into the fields the inference API
   // expects (request-level override → else fall back to prompt-version binding).
@@ -160,7 +162,24 @@ export function ProjectWorkspacePage() {
           </ButtonRow>
         </LeftPanel>
         <RightPanel>
-          <ResultsPanel projectId={currentProject.id} models={models} prompts={prompts} />
+          <ResultsPanel
+            projectId={currentProject.id}
+            models={models}
+            prompts={prompts}
+            promptBuilderEnabled={promptBuilderEnabled}
+            setPromptBuilderEnabled={setPromptBuilderEnabled}
+            selectedHistoryRunId={selectedHistoryRunId}
+            setSelectedHistoryRunId={setSelectedHistoryRunId}
+            selectedVersion={selectedVersion}
+            selectedModel={selectedModel}
+            onVersionCreated={(versionId: string) => {
+              // Find the new version in the prompts and select it
+              const newVersion = prompts
+                .flatMap((p) => p.versions)
+                .find((v) => v.id === versionId);
+              if (newVersion) setSelectedVersion(newVersion);
+            }}
+          />
         </RightPanel>
       </WorkspaceLayout>
 

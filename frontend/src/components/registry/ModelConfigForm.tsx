@@ -15,6 +15,7 @@ const PROVIDERS = [
   { value: 'anthropic', label: 'Anthropic Claude' },
   { value: 'openai', label: 'OpenAI' },
   { value: 'google', label: 'Google Gemini' },
+  { value: 'nvidia', label: 'NVIDIA' },
   { value: 'ollama', label: 'Ollama (Local)' },
   { value: 'mlx_local', label: 'MLX Local (Apple Silicon) — supports LoRA adapter' },
 ];

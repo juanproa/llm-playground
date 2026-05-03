@@ -122,11 +122,12 @@ export function PromptEditor({ projectId, prompts, selectedPrompt, selectedVersi
     if (!selectedPrompt || !editedContent.trim()) return;
     setSaving(true);
     try {
-      const version = await createVersion(selectedPrompt.id, {
+      const { version, prompt } = await createVersion(selectedPrompt.id, {
         content: editedContent,
         system_message: editedSystem || undefined,
         label: `edited from v${selectedVersion?.version_number || 1}`,
       });
+      onSelectPrompt(prompt);
       onSelectVersion(version);
       setDirty(false);
     } finally {
@@ -148,7 +149,9 @@ export function PromptEditor({ projectId, prompts, selectedPrompt, selectedVersi
 
   const handleCreateVersion = async () => {
     if (!selectedPrompt || !newContent.trim()) return;
-    await createVersion(selectedPrompt.id, { content: newContent, system_message: newSystem || undefined });
+    const { version, prompt } = await createVersion(selectedPrompt.id, { content: newContent, system_message: newSystem || undefined });
+    onSelectPrompt(prompt);
+    onSelectVersion(version);
     setNewContent(''); setNewSystem('');
     setShowNewVersion(false);
   };

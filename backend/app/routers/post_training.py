@@ -58,7 +58,7 @@ from app.schemas.post_training import (
     TrainingJobCreate,
     TrainingJobResponse,
 )
-from app.services import backtest_service, comparison_service, dataset_cleaner, feedback_service, fusion_service, sft_service
+from app.services import backtest_service, comparison_service, dataset_cleaner, feedback_service, fusion_service, sft_service, test_case_pii_service
 from app.services.mlx_catalog import KNOWN_HF_MODELS, KNOWN_MLX_MODELS
 from app.services.pdf_parser import parse_pdf
 
@@ -118,6 +118,22 @@ async def delete_dataset(project_id: str, dataset_id: str, db: AsyncSession = De
     if not dataset or dataset.project_id != project_id:
         raise HTTPException(status_code=404, detail="Dataset not found")
 
+    # SQLite (foreign_keys=ON) rejects the delete unless we purge children that
+    # FK back to this dataset. TrainingJob.dataset_id is the only such ref
+    # outside of DatasetItem.
+    running = (await db.execute(
+        select(TrainingJob).where(
+            TrainingJob.dataset_id == dataset_id,
+            TrainingJob.status == "running",
+        )
+    )).scalars().all()
+    if running:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot delete: {len(running)} training job(s) on this dataset are still running. Stop them first.",
+        )
+
+    await db.execute(delete(TrainingJob).where(TrainingJob.dataset_id == dataset_id))
     await db.execute(delete(DatasetItem).where(DatasetItem.dataset_id == dataset_id))
     await db.delete(dataset)
     await db.flush()
@@ -328,6 +344,24 @@ async def stop_training_job(
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete(f"{PREFIX}/training-jobs/{{job_id}}", status_code=204)
+async def delete_training_job(
+    project_id: str,
+    job_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    job = await db.get(TrainingJob, job_id)
+    if not job or job.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Training job not found")
+    if job.status == "running":
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot delete a running training job. Stop it first.",
+        )
+    await db.delete(job)
+    await db.flush()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -581,7 +615,11 @@ async def list_test_cases(project_id: str, db: AsyncSession = Depends(get_db)):
         .where(TestCase.project_id == project_id)
         .order_by(TestCase.created_at.desc())
     )
-    return list(result.scalars().all())
+    cases = list(result.scalars().all())
+    # Replace `input_text` with the PII-masked version when the source dataset
+    # item has been masked. This is the API-boundary enforcement of the rule
+    # "if a mask exists, never return the original".
+    return await test_case_pii_service.build_safe_responses(db, cases)
 
 
 @router.post(f"{PREFIX}/test-cases", response_model=TestCaseResponse, status_code=201)
@@ -597,7 +635,7 @@ async def create_test_case(
     tc = TestCase(project_id=project_id, **payload)
     db.add(tc)
     await db.flush()
-    return tc
+    return await test_case_pii_service.build_safe_response(db, tc)
 
 
 @router.put(f"{PREFIX}/test-cases/{{tc_id}}", response_model=TestCaseResponse)
@@ -616,11 +654,17 @@ async def update_test_case(
     if "assertions" in update_data:
         val = update_data["assertions"]
         update_data["assertions"] = json.dumps(val) if val is not None else None
+    # Changing input_text invalidates any prior PII-mask result on this test
+    # case — the masked text was for the OLD input. Reset so the user knows
+    # they need to re-mask before running a backtest.
+    if "input_text" in update_data and update_data["input_text"] != tc.input_text:
+        tc.pii_status = "unchecked"
+        tc.pii_masked_content = None
     for field, value in update_data.items():
         setattr(tc, field, value)
 
     await db.flush()
-    return tc
+    return await test_case_pii_service.build_safe_response(db, tc)
 
 
 @router.delete(f"{PREFIX}/test-cases/{{tc_id}}", status_code=204)
@@ -667,6 +711,44 @@ async def bulk_delete_test_cases(
     await db.flush()
 
 
+@router.post(f"{PREFIX}/test-cases/mask-pii", response_model=dict, status_code=202)
+async def mask_test_cases_pii(
+    project_id: str,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
+    """Kick off PII detection and masking for every test case in the project
+    that hasn't been processed yet (`pii_status='unchecked'`).
+
+    Mirrors the dataset-level `POST /input-datasets/{id}/mask-pii` endpoint.
+    Uses the same local privacy-filter model.
+    """
+    from app.services.pii_filter_service import is_loaded
+
+    if not is_loaded():
+        raise HTTPException(
+            status_code=409,
+            detail="PII filter model is not loaded. Preload it first via the Datasets page.",
+        )
+
+    result = await db.execute(
+        select(TestCase)
+        .where(TestCase.project_id == project_id)
+        .where(TestCase.pii_status == "unchecked")
+    )
+    pending = list(result.scalars().all())
+    if not pending:
+        return {"queued_count": 0, "message": "No unchecked test cases to process"}
+
+    background_tasks.add_task(
+        test_case_pii_service.mask_pii_for_project_test_cases, project_id
+    )
+    return {
+        "queued_count": len(pending),
+        "message": f"PII masking queued for {len(pending)} test case(s)",
+    }
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # BACKTEST RUNS
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -706,7 +788,37 @@ async def create_backtest_run(
     if not test_cases:
         raise HTTPException(status_code=400, detail="No test cases found for this project")
 
-    # Create the run record
+    # Project policy: backtests may only run on PII-masked data when the test
+    # case is sourced from a dataset. Refuse the run if any test case's source
+    # InputDatasetItem hasn't been masked yet.
+    unmasked = await test_case_pii_service.find_unmasked_test_cases(db, test_cases)
+    if unmasked:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "unmasked_data",
+                "message": (
+                    f"{len(unmasked)} test case(s) are sourced from dataset items "
+                    "that have not been PII-masked. Mask those items first, or "
+                    "remove the test cases, then re-run."
+                ),
+                "unmasked_test_cases": [
+                    {"id": tc.id, "name": tc.name} for tc in unmasked[:25]
+                ],
+                "unmasked_count": len(unmasked),
+            },
+        )
+
+    # Compute the input signature for analytics / future cache use. We persist
+    # it on the row but DO NOT block on it — every "Run Backtest" click creates
+    # a fresh run, even when the same combo was run before. The InferenceCache
+    # is what makes repeated identical runs cheap; users get a new BacktestRun
+    # row each time so they can compare runs over time.
+    target_signature = await test_case_pii_service.compute_input_signature(
+        db, test_cases
+    )
+
+    # Create the run record (with the input_signature we already computed)
     run = BacktestRun(
         project_id=project_id,
         name=data.name,
@@ -715,6 +827,7 @@ async def create_backtest_run(
         pass_threshold=data.pass_threshold,
         judge_model_config_id=data.judge_model_config_id,
         total_cases=len(test_cases),
+        input_signature=target_signature,
     )
     db.add(run)
     await db.flush()
@@ -756,10 +869,15 @@ async def get_backtest_run(project_id: str, run_id: str, db: AsyncSession = Depe
     )
     raw_results = list(result.scalars().all())
 
-    # Enrich results with test case data
+    # Enrich results with test case data — running each test case through the
+    # PII service so the returned `input_text` is the masked version when the
+    # source InputDatasetItem has been masked.
     enriched = []
     for r in raw_results:
         tc = await db.get(TestCase, r.test_case_id)
+        tc_response = (
+            await test_case_pii_service.build_safe_response(db, tc) if tc else None
+        )
         enriched.append(BacktestResultResponse(
             id=r.id,
             backtest_run_id=r.backtest_run_id,
@@ -770,7 +888,7 @@ async def get_backtest_run(project_id: str, run_id: str, db: AsyncSession = Depe
             latency_ms=r.latency_ms,
             error_message=r.error_message,
             created_at=r.created_at,
-            test_case=TestCaseResponse.model_validate(tc) if tc else None,
+            test_case=tc_response,
         ))
 
     return BacktestRunWithResultsResponse(

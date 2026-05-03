@@ -190,6 +190,10 @@ export interface TestCase {
   source_input_dataset_item_id?: string | null;
   assertions: string | null;          // raw JSON string; parse with JSON.parse
   pass_threshold: number | null;
+  // PII mask state on this test case itself (parallel to the source dataset item).
+  // 'unchecked' | 'clean' | 'masked'. The `input_text` field above is already
+  // the safe (masked when applicable) version — this is just the badge.
+  pii_status: string;
   created_at: string;
   updated_at: string;
 }
@@ -449,7 +453,9 @@ export interface InputDatasetItem {
   quality_status: string;
   quality_reason: string | null;
   pii_status: string;
-  pii_masked_content: string | null;
+  // NB: `content` is always the PII-safe version. The backend used to expose
+  // `pii_masked_content` separately, but it was removed because it allowed
+  // callers to bypass the mask by reading the wrong field.
   created_at: string;
 }
 

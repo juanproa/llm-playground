@@ -292,14 +292,9 @@ export function InputPanel({
 
   const pickDatasetItem = (item: InputDatasetItem) => {
     const header = item.name ? `--- ${item.name} ---\n` : '';
-    // Once an item has been PII-masked, the masked text is the only version
-    // we feed downstream — mirrors `InputDatasetItem.effective_content` on
-    // the backend.
-    const body =
-      item.pii_status === 'masked' && item.pii_masked_content
-        ? item.pii_masked_content
-        : item.content;
-    onInputTextChange(header + body);
+    // `item.content` is now PII-safe at the API boundary — when the source
+    // has been masked, the backend swaps in the masked text before serializing.
+    onInputTextChange(header + item.content);
   };
 
   const promptKb = selectedVersion?.kb_id

@@ -122,6 +122,9 @@ export const postTrainingApi = {
       method: 'POST',
     }),
 
+  deleteTrainingJob: (projectId: string, jobId: string) =>
+    apiFetch<void>(`${base(projectId)}/training-jobs/${jobId}`, { method: 'DELETE' }),
+
   // SFT: backends, catalogs, artifacts
   listSftBackends: () =>
     apiFetch<TrainingBackendInfo[]>(`/post-training/sft/backends`),
@@ -312,6 +315,17 @@ export const postTrainingApi = {
       method: 'POST',
       body: JSON.stringify({ ids }),
     }),
+
+  /**
+   * Kick off PII detection + masking on every test case in the project that
+   * still has `pii_status='unchecked'`. Same flow as the dataset-level mask.
+   * Returns the count queued; actual masking runs in the background.
+   */
+  maskTestCasesPii: (projectId: string) =>
+    apiFetch<{ queued_count: number; message: string }>(
+      `${base(projectId)}/test-cases/mask-pii`,
+      { method: 'POST' },
+    ),
 
   // Backtest Runs
   listBacktestRuns: (projectId: string) =>

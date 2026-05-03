@@ -8,7 +8,7 @@ from sqlalchemy import text
 
 from app.config import settings
 from app.database import Base, engine
-from app.routers import health, projects, prompts, documents, models, inference, post_training, knowledge_base, chat, input_datasets, chains
+from app.routers import health, projects, prompts, documents, models, inference, post_training, knowledge_base, chat, input_datasets, chains, prompt_builder
 
 # Import post-training models so Base.metadata.create_all picks them up
 from app.models.post_training import (  # noqa: F401
@@ -40,6 +40,10 @@ def _run_migrations(conn) -> None:
     migrations = [
         ("pt_backtest_runs", "pass_threshold", "ALTER TABLE pt_backtest_runs ADD COLUMN pass_threshold FLOAT DEFAULT 0.5"),
         ("pt_backtest_runs", "judge_model_config_id", "ALTER TABLE pt_backtest_runs ADD COLUMN judge_model_config_id VARCHAR(36)"),
+        ("pt_backtest_runs", "input_signature", "ALTER TABLE pt_backtest_runs ADD COLUMN input_signature VARCHAR(64)"),
+        ("pt_inference_cache", "input_hash", "ALTER TABLE pt_inference_cache ADD COLUMN input_hash VARCHAR(64)"),
+        ("pt_test_cases", "pii_status", "ALTER TABLE pt_test_cases ADD COLUMN pii_status VARCHAR(20) DEFAULT 'unchecked'"),
+        ("pt_test_cases", "pii_masked_content", "ALTER TABLE pt_test_cases ADD COLUMN pii_masked_content TEXT"),
         ("model_configs", "adapter_path", "ALTER TABLE model_configs ADD COLUMN adapter_path VARCHAR(500)"),
         ("pt_test_cases", "assertions", "ALTER TABLE pt_test_cases ADD COLUMN assertions TEXT"),
         ("pt_test_cases", "pass_threshold", "ALTER TABLE pt_test_cases ADD COLUMN pass_threshold FLOAT"),
@@ -144,6 +148,36 @@ def _run_migrations(conn) -> None:
     except Exception as e:
         logger.warning("Stale-comparison cleanup skipped: %s", e)
 
+    # One-shot backfill: completed BacktestRuns whose pass/fail aggregates were
+    # never written because of the SQLAlchemy identity-map staleness bug (the
+    # outer session's cached BacktestResult rows hid the children's status
+    # updates from the aggregate SELECT). Recompute from BacktestResult rows.
+    # Idempotent — only touches runs that look unaggregated.
+    try:
+        broken = conn.execute(text(
+            "SELECT id FROM pt_backtest_runs "
+            "WHERE status = 'completed' AND passed_cases = 0 AND failed_cases = 0 AND total_cases > 0"
+        )).fetchall()
+        for (run_id,) in broken:
+            counts = conn.execute(text(
+                "SELECT status, COUNT(*) FROM pt_backtest_results "
+                "WHERE backtest_run_id = :id GROUP BY status"
+            ), {"id": run_id}).fetchall()
+            by_status = {s: c for s, c in counts}
+            passed = by_status.get("passed", 0)
+            failed = by_status.get("failed", 0) + by_status.get("error", 0)
+            scored = passed + failed
+            total = sum(by_status.values())
+            pass_rate = (passed / scored) if scored > 0 else None
+            conn.execute(text(
+                "UPDATE pt_backtest_runs SET passed_cases = :p, failed_cases = :f, "
+                "total_cases = :t, pass_rate = :r WHERE id = :id"
+            ), {"p": passed, "f": failed, "t": total, "r": pass_rate, "id": run_id})
+        if broken:
+            logger.info("Backfill: recomputed aggregates for %d backtest run(s)", len(broken))
+    except Exception as e:
+        logger.warning("Backtest aggregate backfill skipped: %s", e)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -181,3 +215,4 @@ app.include_router(knowledge_base.router, prefix="/api/v1")
 app.include_router(input_datasets.router, prefix="/api/v1")
 app.include_router(chat.router, prefix="/api/v1")
 app.include_router(chains.router, prefix="/api/v1")
+app.include_router(prompt_builder.router, prefix="/api/v1")

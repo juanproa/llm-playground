@@ -943,19 +943,19 @@ export function DatasetsPage() {
                                 </DetailBox>
                               </div>
                             )}
-                            {item.pii_status === 'masked' && item.pii_masked_content && (
-                              <div>
-                                <Label>Masked Content (PII replaced)</Label>
-                                <DetailBox style={{ borderColor: tokens.colors.accent.warning }}>
-                                  {item.pii_masked_content}
-                                </DetailBox>
-                              </div>
-                            )}
                             <div>
                               <Label>
-                                {item.pii_status === 'masked' ? 'Original Content (contains PII)' : 'Content'}
+                                {item.pii_status === 'masked'
+                                  ? 'Content (PII replaced with placeholders)'
+                                  : 'Content'}
                               </Label>
-                              <DetailBox>
+                              <DetailBox
+                                style={
+                                  item.pii_status === 'masked'
+                                    ? { borderColor: tokens.colors.accent.warning }
+                                    : undefined
+                                }
+                              >
                                 {item.parse_status === 'pending' && !item.content
                                   ? '(parsing…)'
                                   : item.content}

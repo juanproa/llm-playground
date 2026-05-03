@@ -8,6 +8,7 @@ import { useInferenceStore } from '../../stores/inferenceStore';
 import { parseThinking, stripThinkingFromStream } from '../../utils/thinkingFilter';
 import { postTrainingApi } from '../../api/postTraining';
 import { documentsApi } from '../../api/documents';
+import { PromptBuilderChat } from './PromptBuilderChat';
 import type { InferenceRun, ModelConfig, Prompt } from '../../types';
 
 const OutputArea = styled.div`
@@ -912,9 +913,27 @@ interface Props {
   projectId: string;
   models: ModelConfig[];
   prompts: Prompt[];
+  promptBuilderEnabled: boolean;
+  setPromptBuilderEnabled: (enabled: boolean) => void;
+  selectedHistoryRunId: string | null;
+  setSelectedHistoryRunId: (id: string | null) => void;
+  selectedVersion: any;
+  selectedModel: any;
+  onVersionCreated: (versionId: string) => void;
 }
 
-export function ResultsPanel({ projectId, models, prompts }: Props) {
+export function ResultsPanel({
+  projectId,
+  models,
+  prompts,
+  promptBuilderEnabled,
+  setPromptBuilderEnabled,
+  selectedHistoryRunId,
+  setSelectedHistoryRunId,
+  selectedVersion,
+  selectedModel,
+  onVersionCreated,
+}: Props) {
   const { currentOutput, isStreaming, error, history, deleteRun, deleteBulk, clearHistory } = useInferenceStore();
   const [selectedRun, setSelectedRun] = useState<InferenceRun | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -1024,72 +1043,101 @@ export function ResultsPanel({ projectId, models, prompts }: Props) {
         <Card style={{ padding: 0, overflow: 'hidden' }}>
           <HistoryToolbar>
             <ToolbarLeft>
-              <CardTitle style={{ margin: 0 }}>Run History</CardTitle>
+              <CardTitle style={{ margin: 0 }}>
+                {promptBuilderEnabled ? 'Prompt Builder' : 'Run History'}
+              </CardTitle>
               <Badge color="secondary">{history.length}</Badge>
+              <Button
+                size="sm"
+                variant={promptBuilderEnabled ? 'primary' : 'ghost'}
+                onClick={() => {
+                  if (!promptBuilderEnabled && history.length > 0) {
+                    setSelectedHistoryRunId(history[0].id);
+                  }
+                  setPromptBuilderEnabled(!promptBuilderEnabled);
+                }}
+              >
+                {promptBuilderEnabled ? 'Prompt Builder On' : 'Enable Prompt Builder'}
+              </Button>
             </ToolbarLeft>
-            <ToolbarActions>
-              {selectMode ? (
-                <>
-                  {selectedIds.size > 0 && (
-                    <SelectCount>{selectedIds.size} selected</SelectCount>
-                  )}
-                  <Button size="sm" variant="ghost" onClick={toggleAll}>
-                    {selectedIds.size === history.length ? 'Deselect All' : 'Select All'}
-                  </Button>
-                  <Button size="sm" variant="danger" onClick={handleDeleteSelected} disabled={selectedIds.size === 0}>
-                    Delete Selected
-                  </Button>
-                  <Button size="sm" variant="ghost" onClick={exitSelectMode}>Cancel</Button>
-                </>
-              ) : (
-                <>
-                  <Button size="sm" variant="ghost" onClick={() => setSelectMode(true)}>Select</Button>
-                  <Button size="sm" variant="danger" onClick={handleClearAll}>Clear All</Button>
-                </>
-              )}
-            </ToolbarActions>
+            {!promptBuilderEnabled && (
+              <ToolbarActions>
+                {selectMode ? (
+                  <>
+                    {selectedIds.size > 0 && (
+                      <SelectCount>{selectedIds.size} selected</SelectCount>
+                    )}
+                    <Button size="sm" variant="ghost" onClick={toggleAll}>
+                      {selectedIds.size === history.length ? 'Deselect All' : 'Select All'}
+                    </Button>
+                    <Button size="sm" variant="danger" onClick={handleDeleteSelected} disabled={selectedIds.size === 0}>
+                      Delete Selected
+                    </Button>
+                    <Button size="sm" variant="ghost" onClick={exitSelectMode}>Cancel</Button>
+                  </>
+                ) : (
+                  <>
+                    <Button size="sm" variant="ghost" onClick={() => setSelectMode(true)}>Select</Button>
+                    <Button size="sm" variant="danger" onClick={handleClearAll}>Clear All</Button>
+                  </>
+                )}
+              </ToolbarActions>
+            )}
           </HistoryToolbar>
-          {history.slice(0, 50).map((run) => (
-            <HistoryItem
-              key={run.id}
-              $active={selectedRun?.id === run.id}
-              onClick={() => selectMode ? undefined : setSelectedRun(run)}
-            >
-              <HistoryRow>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                  {selectMode && (
-                    <CheckboxWrapper
-                      $checked={selectedIds.has(run.id)}
-                      onClick={(e) => toggleSelect(run.id, e)}
-                    />
+          {promptBuilderEnabled && selectedHistoryRunId ? (
+            <PromptBuilderChat
+              projectId={projectId}
+              runId={selectedHistoryRunId}
+              promptVersionId={selectedVersion?.id}
+              modelConfigId={selectedModel?.id}
+              models={models}
+              onVersionCreated={onVersionCreated}
+            />
+          ) : (
+            <>
+              {history.slice(0, 50).map((run) => (
+                <HistoryItem
+                  key={run.id}
+                  $active={selectedRun?.id === run.id}
+                  onClick={() => selectMode ? undefined : setSelectedRun(run)}
+                >
+                  <HistoryRow>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      {selectMode && (
+                        <CheckboxWrapper
+                          $checked={selectedIds.has(run.id)}
+                          onClick={(e) => toggleSelect(run.id, e)}
+                        />
+                      )}
+                      <Badge
+                        color={
+                          run.status === 'completed' ? 'success'
+                          : run.status === 'failed' ? 'error'
+                          : 'warning'
+                        }
+                      >
+                        {run.status}
+                      </Badge>
+                      <span style={{ color: tokens.colors.text.secondary, fontSize: '0.8rem', fontWeight: 500 }}>
+                        {resolveModelName(run.model_config_id)}
+                      </span>
+                    </div>
+                    <HistoryMeta>
+                      {run.latency_ms != null && <span>{formatDuration(run.latency_ms)}</span>}
+                      {run.token_usage_input != null && <span>{formatTokens(run.token_usage_input)} in</span>}
+                      {run.token_usage_output != null && <span>{formatTokens(run.token_usage_output)} out</span>}
+                      <span>{formatDate(run.created_at)}</span>
+                    </HistoryMeta>
+                  </HistoryRow>
+                  {run.output_text && (
+                    <HistoryPreview>
+                      {parseThinking(run.output_text).answer.substring(0, 120)}
+                    </HistoryPreview>
                   )}
-                  <Badge
-                    color={
-                      run.status === 'completed' ? 'success'
-                      : run.status === 'failed' ? 'error'
-                      : 'warning'
-                    }
-                  >
-                    {run.status}
-                  </Badge>
-                  <span style={{ color: tokens.colors.text.secondary, fontSize: '0.8rem', fontWeight: 500 }}>
-                    {resolveModelName(run.model_config_id)}
-                  </span>
-                </div>
-                <HistoryMeta>
-                  {run.latency_ms != null && <span>{formatDuration(run.latency_ms)}</span>}
-                  {run.token_usage_input != null && <span>{formatTokens(run.token_usage_input)} in</span>}
-                  {run.token_usage_output != null && <span>{formatTokens(run.token_usage_output)} out</span>}
-                  <span>{formatDate(run.created_at)}</span>
-                </HistoryMeta>
-              </HistoryRow>
-              {run.output_text && (
-                <HistoryPreview>
-                  {parseThinking(run.output_text).answer.substring(0, 120)}
-                </HistoryPreview>
-              )}
-            </HistoryItem>
-          ))}
+                </HistoryItem>
+              ))}
+            </>
+          )}
         </Card>
       )}
 

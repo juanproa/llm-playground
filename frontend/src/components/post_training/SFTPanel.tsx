@@ -443,8 +443,8 @@ export function SFTPanel({ projectId }: Props) {
       await postTrainingApi.deleteDataset(projectId, dataset.id);
       if (selectedDataset?.id === dataset.id) setSelectedDataset(null);
       await loadData();
-    } catch {
-      // silently fail
+    } catch (e) {
+      alert((e as Error).message);
     }
   }
 
@@ -541,6 +541,17 @@ export function SFTPanel({ projectId }: Props) {
       if (selectedJob?.id === jobId) setSelectedJob(updated);
     } catch {
       // silently fail
+    }
+  }
+
+  async function handleDeleteJob(job: TrainingJob) {
+    if (!confirm(`Delete training job "${job.name}"? This cannot be undone.`)) return;
+    try {
+      await postTrainingApi.deleteTrainingJob(projectId, job.id);
+      setTrainingJobs((prev) => prev.filter((j) => j.id !== job.id));
+      if (selectedJob?.id === job.id) setSelectedJob(null);
+    } catch (e) {
+      alert((e as Error).message);
     }
   }
 
@@ -837,10 +848,22 @@ export function SFTPanel({ projectId }: Props) {
             <Card key={job.id} onClick={() => openJobModal(job)}>
               <Row style={{ justifyContent: 'space-between', marginBottom: 4 }}>
                 <CardTitle>{job.name}</CardTitle>
-                <Badge color={getJobBadgeColor(job.status)}>
-                  {job.status === 'running' && <RunningDot />}
-                  {job.status}
-                </Badge>
+                <Row style={{ gap: 6 }}>
+                  <Badge color={getJobBadgeColor(job.status)}>
+                    {job.status === 'running' && <RunningDot />}
+                    {job.status}
+                  </Badge>
+                  <Button
+                    size="sm"
+                    variant="danger"
+                    title={job.status === 'running' ? 'Stop the job before deleting' : 'Delete this training job'}
+                    disabled={job.status === 'running'}
+                    onClick={(e) => { e.stopPropagation(); handleDeleteJob(job); }}
+                    style={{ fontSize: '0.7rem', padding: '2px 8px' }}
+                  >
+                    Delete
+                  </Button>
+                </Row>
               </Row>
               <CardMeta>{job.base_model} · {job.backend}</CardMeta>
               {job.error_message && (

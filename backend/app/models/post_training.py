@@ -143,6 +143,14 @@ class TestCase(Base):
     # Per-test-case pass threshold (0.0-1.0) when assertions are present.
     # Overall score = weighted average of assertion scores; passed iff overall >= threshold.
     pass_threshold: Mapped[float | None] = mapped_column(nullable=True)
+    # PII masking applied directly to this test case (parallel to InputDatasetItem):
+    #   unchecked → masking has not been run yet
+    #   clean     → ran, no PII detected (raw input_text is safe)
+    #   masked    → ran, PII detected and replaced; pii_masked_content holds it
+    # Test cases sourced from an InputDatasetItem can also inherit safety from
+    # that source — see test_case_pii_service.get_safe_input_text for precedence.
+    pii_status: Mapped[str] = mapped_column(String(20), default="unchecked")
+    pii_masked_content: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
@@ -171,6 +179,14 @@ class BacktestRun(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    # Hash of the actual safe inputs sent to the model at run-creation time.
+    # Used by the duplicate-run guard so a re-run after PII masking the source
+    # data is not mistakenly blocked as a duplicate (the model gets different
+    # text, so it's a genuinely different run).
+    # Nullable for backwards compat with rows created before this column existed —
+    # a NULL signature is treated as "unknown" and does not match any new run.
+    input_signature: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     project = relationship("Project")
     prompt_version = relationship("PromptVersion")
@@ -216,6 +232,13 @@ class InferenceCache(Base):
     document_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     max_tokens: Mapped[int] = mapped_column(Integer, default=0)
     temperature: Mapped[float] = mapped_column(default=0.0)
+    # SHA-256 of the actual safe input that produced this output. Including
+    # this in the cache key prevents stale outputs being returned when the
+    # underlying source is re-masked: a different input text → different
+    # hash → cache miss → fresh model call.
+    # Nullable for rows created before this column existed; lookups never
+    # match NULL, so old entries become unreachable rather than incorrect.
+    input_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # Cached output
     output: Mapped[str] = mapped_column(Text, nullable=False)
     latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)

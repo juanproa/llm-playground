@@ -204,7 +204,7 @@ class TestCaseResponse(BaseModel):
     id: str
     project_id: str
     name: str
-    input_text: str
+    input_text: str  # PII-safe at API boundary (test_case_pii_service swaps in masked content)
     expected_output: str
     expected_type: str
     tags: str | None
@@ -215,6 +215,11 @@ class TestCaseResponse(BaseModel):
     source_input_dataset_item_id: str | None = None
     assertions: str | None = None  # raw JSON string; frontend parses it
     pass_threshold: float | None = None
+    # PII masking state on this test case itself (parallel to InputDatasetItem):
+    #   unchecked | clean | masked
+    # NB: pii_masked_content is intentionally omitted from the response — the
+    # masked text is exposed via input_text, same pattern as InputDatasetItem.
+    pii_status: str = "unchecked"
     created_at: datetime
     updated_at: datetime
 

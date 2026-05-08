@@ -18,6 +18,7 @@ from app.models.document import Document
 from app.models.model_config import ModelConfig
 from app.models.post_training import BacktestResult, BacktestRun, InferenceCache, TestCase
 from app.models.prompt import PromptVersion
+from app.providers.base import LLMResponse
 from app.providers.registry import get_provider
 from app.services import assertion_engine, test_case_pii_service
 from app.services.inference_service import _final_cleanup
@@ -27,6 +28,36 @@ logger = logging.getLogger(__name__)
 
 MAX_CONCURRENT = 5
 DEFAULT_MAX_TOKENS = 4096
+
+
+async def _stream_to_response(provider, **kwargs) -> LLMResponse:
+    """Run the provider's streaming API but accumulate into an LLMResponse.
+
+    Streaming keeps the connection alive against proxies (e.g. Cloudflare's
+    120s timeout on RunPod), even when generation itself takes minutes —
+    which it can with reasoning models on long prompts.
+
+    On stream failure (e.g. Gemini "incomplete chunked read"), fall back to
+    a single non-streaming call so a transient stream error doesn't fail
+    the whole backtest case.
+    """
+    try:
+        parts: list[str] = []
+        async for chunk in provider.stream(**kwargs):
+            parts.append(chunk)
+        if parts:
+            return LLMResponse(
+                content="".join(parts),
+                input_tokens=0,
+                output_tokens=0,
+                model=kwargs.get("model_id", ""),
+            )
+        # Empty stream: treat as failure and fall through to generate()
+        logger.warning("Streaming returned no content; falling back to generate()")
+    except Exception as e:
+        logger.warning("Streaming failed (%s); falling back to generate()", e)
+
+    return await provider.generate(**kwargs)
 
 
 def _strip_think(text: str | None) -> str:
@@ -217,7 +248,8 @@ async def _score_with_judge(
         judge_extra.setdefault("adapter_path", judge_model.adapter_path)
 
     try:
-        response = await provider.generate(
+        response = await _stream_to_response(
+            provider,
             messages=[{"role": "user", "content": prompt}],
             model_id=judge_model.model_id,
             max_tokens=400,
@@ -576,7 +608,10 @@ async def _run_single_case(
         # and the user has explicitly asked for fresh model calls every time.
         # The pt_inference_cache table is left in place for analytics / future
         # opt-in caching, but no row is ever read or written here.
-        response = await provider.generate(
+        # Streaming so reasoning-model long generations don't trip Cloudflare's
+        # 120s proxy timeout on RunPod.
+        response = await _stream_to_response(
+            provider,
             messages=messages,
             model_id=model_snap["model_id"],
             max_tokens=max_tokens,

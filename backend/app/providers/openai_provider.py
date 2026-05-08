@@ -51,6 +51,32 @@ class OpenAIProvider:
             temperature=temperature,
             stream=True,
         )
+        # When the upstream is vLLM with --reasoning-parser, reasoning tokens
+        # arrive as `delta.reasoning_content` instead of `delta.content`. If
+        # we ignore them, the stream goes silent during the (long) thinking
+        # phase and intermediate proxies (Cloudflare, RunPod) close the
+        # connection on idle timeout. Wrap reasoning chunks in <think>…</think>
+        # so the connection keeps flowing data and `_strip_think` can clean
+        # them up downstream.
+        in_thinking = False
         async for chunk in stream:
-            if chunk.choices and chunk.choices[0].delta.content:
-                yield chunk.choices[0].delta.content
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            reasoning = getattr(delta, "reasoning_content", None) or ""
+            content = delta.content or ""
+
+            if reasoning:
+                if not in_thinking:
+                    yield "<think>"
+                    in_thinking = True
+                yield reasoning
+
+            if content:
+                if in_thinking:
+                    yield "</think>"
+                    in_thinking = False
+                yield content
+
+        if in_thinking:
+            yield "</think>"

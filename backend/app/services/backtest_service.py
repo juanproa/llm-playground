@@ -26,7 +26,7 @@ from app.services.model_config_service import decrypt_api_key
 
 logger = logging.getLogger(__name__)
 
-MAX_CONCURRENT = 5
+MAX_CONCURRENT = 1
 DEFAULT_MAX_TOKENS = 4096
 
 
@@ -70,6 +70,106 @@ def _strip_think(text: str | None) -> str:
     if not text:
         return ""
     return _final_cleanup(text)
+
+
+def _find_last_top_level_json(text: str) -> str | None:
+    """Scan `text` for top-level balanced `{…}` blocks and return the LAST
+    one that parses as valid JSON. Handles strings/escapes correctly so braces
+    inside string literals don't confuse the depth counter.
+
+    Returns None if no valid JSON object is found.
+    """
+    last_valid: str | None = None
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i] != "{":
+            i += 1
+            continue
+        # Walk forward from i, tracking brace depth and string state.
+        depth = 0
+        in_string = False
+        escape = False
+        end = -1
+        for j in range(i, n):
+            c = text[j]
+            if escape:
+                escape = False
+                continue
+            if c == "\\":
+                escape = True
+                continue
+            if c == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    end = j
+                    break
+        if end == -1:
+            # Unbalanced from i onward; no more top-level objects to find.
+            break
+        candidate = text[i:end + 1]
+        try:
+            json.loads(candidate)
+            last_valid = candidate
+        except (json.JSONDecodeError, ValueError):
+            pass
+        i = end + 1
+    return last_valid
+
+
+def _extract_clean_output(text: str | None, expected: str | None = None) -> str:
+    """Aggressive cleanup for backtest comparison.
+
+    Beyond `_strip_think` (which only removes canonical reasoning tags), this
+    also strips:
+      • Markdown ```json fences around the answer.
+      • Untagged reasoning prose preceding a final JSON object — common when
+        a reasoning model is served without `--reasoning-parser` and emits
+        chain-of-thought as plain text rather than wrapping it in <think>.
+
+    Triggered only when the test's `expected` looks like JSON; otherwise we
+    leave the cleaned text alone so non-JSON tests aren't accidentally mangled.
+    """
+    if not text:
+        return ""
+    cleaned = _strip_think(text)
+
+    # Detect whether expected output is JSON-shaped. If not, don't try to
+    # extract a JSON sub-object — the test isn't comparing JSON structure.
+    exp = (expected or "").strip()
+    if exp.startswith("```"):
+        exp = re.sub(r"^```(?:json)?\s*|\s*```\s*$", "", exp).strip()
+    expected_is_json = exp.startswith("{") and exp.endswith("}")
+    if not expected_is_json:
+        return cleaned
+
+    # Strip markdown code fences if the model wrapped the answer in ```json…```.
+    body = re.sub(r"```(?:json|JSON)?\s*", "", cleaned)
+    body = re.sub(r"\s*```\s*", "", body).strip()
+
+    # Already pure JSON?
+    if body.startswith("{") and body.endswith("}"):
+        try:
+            json.loads(body)
+            return body
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # Find the LAST top-level balanced JSON object via bracket counting.
+    # Reasoning prose can mention small `{…}` examples; the actual answer is
+    # the final, largest object that parses cleanly.
+    extracted = _find_last_top_level_json(body)
+    if extracted is not None:
+        return extracted
+
+    return cleaned
 
 # Serializes all DB writes coming out of concurrent run_single coroutines.
 # aiosqlite's threading model + SQLAlchemy async sessions don't always honor
@@ -619,7 +719,10 @@ async def _run_single_case(
             **extra_params,
         )
         elapsed_ms = int((time.monotonic() - start) * 1000)
-        actual = _strip_think(response.content)
+        # Aggressive cleanup: <think> tags AND prose preamble around the JSON
+        # answer (reasoning models without --reasoning-parser emit prose
+        # chain-of-thought outside of any <think> wrapper).
+        actual = _extract_clean_output(response.content, tc_expected)
 
         # ── Score the output (no DB needed — pure compute) ──
         tc_threshold = tc_pass_threshold if tc_pass_threshold is not None else run_threshold

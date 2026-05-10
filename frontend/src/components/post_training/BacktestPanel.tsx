@@ -600,6 +600,64 @@ export function BacktestPanel({ projectId }: Props) {
     }
   }
 
+  // ── Live status polling ────────────────────────────────────────────────────
+  // The backend updates run status / passed_cases / failed_cases as the worker
+  // progresses, but the UI only sees those changes if we re-fetch. We poll on
+  // two independent loops so the list and the open run-detail modal both stay
+  // current without a manual refresh:
+  //
+  //   1. List loop — runs every 3s while ANY run in the list is running or
+  //      pending. Updates `backtestRuns`. Stops as soon as all runs reach a
+  //      terminal state (completed / failed / cancelled).
+  //   2. Modal loop — runs every 3s while the selected run (the one open in
+  //      the detail modal) is running or pending. Refreshes `selectedRun`
+  //      including its `results[]` so per-test-case status updates live.
+  //
+  // Both effects depend on the *boolean* "in progress" flags rather than the
+  // full data array, so they don't churn an interval on every poll — the
+  // interval is recreated only when the in-progress state actually flips.
+
+  const anyRunInProgress = backtestRuns.some(
+    (r) => r.status === 'running' || r.status === 'pending',
+  );
+
+  useEffect(() => {
+    if (!anyRunInProgress) return;
+    const interval = setInterval(() => {
+      postTrainingApi
+        .listBacktestRuns(projectId)
+        .then(setBacktestRuns)
+        .catch(() => {
+          // Transient errors are fine — keep polling.
+        });
+    }, 3000);
+    return () => clearInterval(interval);
+  }, [anyRunInProgress, projectId]);
+
+  const selectedRunId = selectedRun?.id ?? null;
+  const selectedRunInProgress =
+    !!selectedRun &&
+    (selectedRun.status === 'running' || selectedRun.status === 'pending');
+
+  useEffect(() => {
+    if (!selectedRunInProgress || !selectedRunId) return;
+    const interval = setInterval(() => {
+      postTrainingApi
+        .getBacktestRun(projectId, selectedRunId)
+        .then((updated) => {
+          // Guard against stale updates if the user closed/swapped the modal
+          // between the request firing and resolving.
+          setSelectedRun((prev) =>
+            prev && prev.id === selectedRunId ? updated : prev,
+          );
+        })
+        .catch(() => {
+          // Transient errors are fine — keep polling.
+        });
+    }, 3000);
+    return () => clearInterval(interval);
+  }, [selectedRunInProgress, selectedRunId, projectId]);
+
   async function handleCreateCase() {
     if (!caseName.trim() || !caseInput.trim() || !caseExpected.trim()) return;
     setLoading(true);
@@ -968,9 +1026,9 @@ export function BacktestPanel({ projectId }: Props) {
     <Layout>
       {/* ── Left: Test Cases ── */}
       <Panel>
-        <PanelHeader>
+        <PanelHeader style={{ flexWrap: 'wrap', gap: 8 }}>
           <PanelTitle>Test Cases ({testCases.length})</PanelTitle>
-          <Row style={{ gap: 8 }}>
+          <Row style={{ gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
             {testCases.length > 0 && (
               <CheckboxRow style={{ marginRight: 4 }}>
                 <input
@@ -1087,8 +1145,19 @@ export function BacktestPanel({ projectId }: Props) {
                 $selected={isExpanded}
                 onClick={() => setExpandedCaseId(isExpanded ? null : tc.id)}
               >
-                <Row style={{ justifyContent: 'space-between', marginBottom: 2 }}>
-                  <CardTitle style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <Row style={{ justifyContent: 'space-between', marginBottom: 2, flexWrap: 'wrap', gap: 6 }}>
+                  <CardTitle
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 8,
+                      minWidth: 0,
+                      flex: '1 1 auto',
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap',
+                    }}
+                  >
                     <input
                       type="checkbox"
                       checked={selectedCaseIds.has(tc.id)}
@@ -1098,9 +1167,11 @@ export function BacktestPanel({ projectId }: Props) {
                     <span style={{ marginRight: 6, fontSize: '0.7rem', opacity: 0.5 }}>
                       {isExpanded ? '▼' : '▶'}
                     </span>
-                    {tc.name}
+                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {tc.name}
+                    </span>
                   </CardTitle>
-                  <Row style={{ gap: 6 }}>
+                  <Row style={{ gap: 6, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
                     {tc.is_golden && <Badge color="warning">Golden</Badge>}
                     <Badge color="secondary">{tc.expected_type}</Badge>
                     {tc.pii_status === 'masked' && (

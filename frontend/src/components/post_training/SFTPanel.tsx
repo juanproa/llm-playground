@@ -6,7 +6,8 @@ import { Badge } from '../common/Badge';
 import { postTrainingApi } from '../../api/postTraining';
 import { inferenceApi } from '../../api/inference';
 import { modelsApi } from '../../api/models';
-import type { ArtifactInfo, Dataset, HfModelInfo, InferenceRun, MlxModelInfo, ModelConfig, TrainingBackendInfo, TrainingJob } from '../../types';
+import { promptsApi } from '../../api/prompts';
+import type { ArtifactInfo, Dataset, HfModelInfo, InferenceRun, MlxModelInfo, ModelConfig, Prompt, TrainingBackendInfo, TrainingJob } from '../../types';
 import type { DatasetWithItems } from '../../api/postTraining';
 import { LossChart } from './LossChart';
 
@@ -18,7 +19,7 @@ interface Props {
 
 const Layout = styled.div`
   display: grid;
-  grid-template-columns: 280px 1fr 340px;
+  grid-template-columns: 340px 1fr 340px;
   height: 100%;
   overflow: hidden;
 `;
@@ -318,6 +319,16 @@ export function SFTPanel({ projectId }: Props) {
   const [loadingView, setLoadingView] = useState(false);
   const [expandedItemId, setExpandedItemId] = useState<string | null>(null);
 
+  // Bulk "set system message" modal
+  const [bulkSystemDataset, setBulkSystemDataset] = useState<Dataset | null>(null);
+  const [bulkSystemMessage, setBulkSystemMessage] = useState('');
+  const [bulkSystemOverwrite, setBulkSystemOverwrite] = useState(false);
+  const [bulkSystemBusy, setBulkSystemBusy] = useState(false);
+  // Project prompts available as starting templates in the bulk modal.
+  const [projectPrompts, setProjectPrompts] = useState<Prompt[]>([]);
+  const [pickedPromptKey, setPickedPromptKey] = useState('');
+  const [pickedPromptSource, setPickedPromptSource] = useState<'system' | 'content' | null>(null);
+
   // Backend/catalog/artifacts state
   const [sftBackends, setSftBackends] = useState<TrainingBackendInfo[]>([]);
   const [mlxModels, setMlxModels] = useState<MlxModelInfo[]>([]);
@@ -437,6 +448,95 @@ export function SFTPanel({ projectId }: Props) {
     }
   }
 
+  async function handleSaveItemSystem(itemId: string, value: string) {
+    if (!viewDataset) return;
+    try {
+      const updated = await postTrainingApi.updateDatasetItem(
+        projectId,
+        viewDataset.id,
+        itemId,
+        // Empty string clears the column, matching the bulk operation's
+        // "no system message" semantics.
+        { system_message: value.trim() ? value : null },
+      );
+      setViewDataset({
+        ...viewDataset,
+        items: viewDataset.items.map((i) => (i.id === itemId ? updated : i)),
+      });
+    } catch (e) {
+      alert((e as Error).message);
+    }
+  }
+
+  function openBulkSystemModal(dataset: Dataset) {
+    setBulkSystemDataset(dataset);
+    setBulkSystemMessage('');
+    setBulkSystemOverwrite(false);
+    setPickedPromptKey('');
+    setPickedPromptSource(null);
+    // Lazy-load the project's prompts the first time the modal opens. They're
+    // small (just a list of versions w/ content + system_message) so a single
+    // fetch per panel mount is fine.
+    if (projectPrompts.length === 0) {
+      promptsApi
+        .list(projectId)
+        .then(setProjectPrompts)
+        .catch(() => {
+          // Non-fatal — the user can still type a system message manually.
+        });
+    }
+  }
+
+  function handlePromptPicked(key: string) {
+    setPickedPromptKey(key);
+    if (!key) {
+      setPickedPromptSource(null);
+      return;
+    }
+    const [promptId, versionId] = key.split('::');
+    const prompt = projectPrompts.find((p) => p.id === promptId);
+    const version = prompt?.versions.find((v) => v.id === versionId);
+    if (!version) return;
+    const sys = (version.system_message || '').trim();
+    if (sys) {
+      setBulkSystemMessage(version.system_message || '');
+      setPickedPromptSource('system');
+    } else {
+      setBulkSystemMessage(version.content || '');
+      setPickedPromptSource('content');
+    }
+  }
+
+  async function handleApplyBulkSystem() {
+    if (!bulkSystemDataset) return;
+    setBulkSystemBusy(true);
+    try {
+      const result = await postTrainingApi.bulkSetSystemMessage(
+        projectId,
+        bulkSystemDataset.id,
+        bulkSystemMessage.trim() ? bulkSystemMessage : null,
+        bulkSystemOverwrite,
+      );
+      alert(
+        `Updated ${result.updated_count} item(s), skipped ${result.skipped_count}` +
+        (result.skipped_count > 0 && !bulkSystemOverwrite
+          ? '\n\nSkipped items already had a system message. Re-run with "Overwrite existing" to change them.'
+          : ''),
+      );
+      const dsId = bulkSystemDataset.id;
+      setBulkSystemDataset(null);
+      // Refresh the items modal if it's showing this dataset.
+      if (viewDataset?.id === dsId) {
+        const refreshed = await postTrainingApi.getDataset(projectId, dsId);
+        setViewDataset(refreshed);
+      }
+    } catch (e) {
+      alert((e as Error).message);
+    } finally {
+      setBulkSystemBusy(false);
+    }
+  }
+
   async function handleDeleteDataset(dataset: Dataset) {
     if (!confirm(`Delete dataset "${dataset.name}" and all its items? This cannot be undone.`)) return;
     try {
@@ -451,6 +551,38 @@ export function SFTPanel({ projectId }: Props) {
   async function handleUploadFile(dataset: Dataset) {
     setSelectedDataset(dataset);
     fileInputRef.current?.click();
+  }
+
+  async function handleExportDataset(dataset: Dataset) {
+    const choice = prompt(
+      `Export "${dataset.name}" as which format?\n\n` +
+      `  alpaca   — JSONL { instruction, input, output, system } (default)\n` +
+      `  messages — JSONL { messages: [...] } (OpenAI chat / SFTTrainer)\n` +
+      `  csv      — CSV with the same columns\n\n` +
+      `Type one of: alpaca, messages, csv`,
+      'alpaca',
+    );
+    if (!choice) return;
+    const format = choice.trim().toLowerCase() as 'alpaca' | 'messages' | 'csv';
+    if (!['alpaca', 'messages', 'csv'].includes(format)) {
+      alert(`Unknown format: ${choice}. Use alpaca, messages, or csv.`);
+      return;
+    }
+    try {
+      const data = await postTrainingApi.exportDataset(projectId, dataset.id, format);
+      const ext = format === 'csv' ? 'csv' : 'jsonl';
+      const mime = format === 'csv' ? 'text/csv' : 'application/x-ndjson';
+      const safeName = dataset.name.replace(/[^a-zA-Z0-9._-]/g, '_');
+      const blob = new Blob([String(data)], { type: mime });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${safeName}-${format}.${ext}`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      alert((e as Error).message);
+    }
   }
 
   async function handleCleanDataset(dataset: Dataset) {
@@ -663,7 +795,7 @@ export function SFTPanel({ projectId }: Props) {
               <CardMeta>
                 {ds.item_count} items · {ds.format}
               </CardMeta>
-              <Row style={{ marginTop: 6 }}>
+              <Row style={{ marginTop: 6, flexWrap: 'wrap' }}>
                 <Button
                   size="sm"
                   onClick={(e) => { e.stopPropagation(); openViewDataset(ds); }}
@@ -678,7 +810,7 @@ export function SFTPanel({ projectId }: Props) {
                   Upload File
                 </Button>
               </Row>
-              <Row style={{ marginTop: 6 }}>
+              <Row style={{ marginTop: 6, flexWrap: 'wrap' }}>
                 <Button
                   size="sm"
                   variant="secondary"
@@ -693,6 +825,22 @@ export function SFTPanel({ projectId }: Props) {
                   title="Deduplicate + normalize whitespace"
                 >
                   Clean
+                </Button>
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  onClick={(e) => { e.stopPropagation(); handleExportDataset(ds); }}
+                  title="Download as JSONL or CSV (alpaca / messages / csv)"
+                >
+                  Export
+                </Button>
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  onClick={(e) => { e.stopPropagation(); openBulkSystemModal(ds); }}
+                  title="Set the system message on every item in this dataset"
+                >
+                  Set System
                 </Button>
                 <Button
                   size="sm"
@@ -1136,9 +1284,11 @@ export function SFTPanel({ projectId }: Props) {
                               gap: 10,
                             }}
                           >
-                            {item.system_message && (
-                              <ItemField label="System Message" value={item.system_message} />
-                            )}
+                            <EditableSystemField
+                              key={`sysmsg-${item.id}`}
+                              value={item.system_message ?? ''}
+                              onSave={(value) => handleSaveItemSystem(item.id, value)}
+                            />
                             {item.instruction && (
                               <ItemField label="Instruction" value={item.instruction} />
                             )}
@@ -1163,6 +1313,142 @@ export function SFTPanel({ projectId }: Props) {
                   })}
                 </div>
               )}
+            </ModalBody>
+          </Modal>
+        </ModalOverlay>
+      )}
+
+      {bulkSystemDataset && (
+        <ModalOverlay onClick={() => !bulkSystemBusy && setBulkSystemDataset(null)}>
+          <Modal onClick={(e) => e.stopPropagation()} style={{ width: 720 }}>
+            <ModalHeader>
+              <div>
+                <ModalTitle>Set system message — {bulkSystemDataset.name}</ModalTitle>
+                <CardMeta style={{ marginTop: 4 }}>
+                  Applies to {bulkSystemDataset.item_count} item(s) in this dataset.
+                </CardMeta>
+              </div>
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => setBulkSystemDataset(null)}
+                disabled={bulkSystemBusy}
+              >
+                Close
+              </Button>
+            </ModalHeader>
+            <ModalBody>
+              <FormGroup>
+                <Label>Start from a project prompt (optional)</Label>
+                <Select
+                  value={pickedPromptKey}
+                  onChange={(e) => handlePromptPicked(e.target.value)}
+                >
+                  <option value="">— pick a prompt to prefill the textarea —</option>
+                  {projectPrompts.map((p) => {
+                    // Sort versions: active first, then highest version_number.
+                    const versions = [...p.versions].sort((a, b) => {
+                      if (a.is_active !== b.is_active) return a.is_active ? -1 : 1;
+                      return b.version_number - a.version_number;
+                    });
+                    return (
+                      <optgroup key={p.id} label={p.name}>
+                        {versions.map((v) => {
+                          const hasSys = !!(v.system_message || '').trim();
+                          const labelBits = [
+                            `v${v.version_number}`,
+                            v.label && `"${v.label}"`,
+                            v.is_active && 'active',
+                            hasSys ? 'has system_message' : 'no system_message → uses content',
+                          ].filter(Boolean);
+                          return (
+                            <option key={v.id} value={`${p.id}::${v.id}`}>
+                              {labelBits.join(' · ')}
+                            </option>
+                          );
+                        })}
+                      </optgroup>
+                    );
+                  })}
+                </Select>
+                {pickedPromptSource && (
+                  <CardMeta style={{ marginTop: 4 }}>
+                    {pickedPromptSource === 'system'
+                      ? 'Filled from the version\'s system_message. Edit below if needed.'
+                      : 'No system_message on this version — filled from content instead. Edit below if needed.'}
+                  </CardMeta>
+                )}
+                {projectPrompts.length === 0 && (
+                  <CardMeta style={{ marginTop: 4 }}>
+                    No prompts found in this project (or still loading). You can still type a system message below.
+                  </CardMeta>
+                )}
+              </FormGroup>
+              <FormGroup style={{ marginTop: 12 }}>
+                <Label>System message</Label>
+                <textarea
+                  value={bulkSystemMessage}
+                  onChange={(e) => {
+                    setBulkSystemMessage(e.target.value);
+                    // Manual edit invalidates the "this came from prompt X" hint.
+                    if (pickedPromptSource) {
+                      setPickedPromptSource(null);
+                      setPickedPromptKey('');
+                    }
+                  }}
+                  placeholder="Paste the system prompt all items should use…"
+                  rows={14}
+                  style={{
+                    width: '100%',
+                    fontFamily: tokens.fonts.mono,
+                    fontSize: '0.78rem',
+                    lineHeight: 1.55,
+                    color: tokens.colors.text.primary,
+                    background: tokens.colors.bg.primary,
+                    border: `1px solid ${tokens.colors.border.subtle}`,
+                    borderRadius: tokens.radii.sm,
+                    padding: '8px 10px',
+                    resize: 'vertical',
+                    minHeight: 200,
+                    maxHeight: 480,
+                    boxSizing: 'border-box',
+                  }}
+                />
+                <CardMeta style={{ marginTop: 4 }}>
+                  Leave the field empty to clear the system message on all items.
+                </CardMeta>
+              </FormGroup>
+              <label
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 8,
+                  marginTop: 12,
+                  fontSize: '0.85rem',
+                  color: tokens.colors.text.primary,
+                  cursor: 'pointer',
+                }}
+              >
+                <input
+                  type="checkbox"
+                  checked={bulkSystemOverwrite}
+                  onChange={(e) => setBulkSystemOverwrite(e.target.checked)}
+                />
+                Overwrite items that already have a system message
+              </label>
+              <Row style={{ marginTop: 16, justifyContent: 'flex-end', gap: 8 }}>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => setBulkSystemDataset(null)}
+                  disabled={bulkSystemBusy}
+                >
+                  Cancel
+                </Button>
+                <Button size="sm" onClick={handleApplyBulkSystem} disabled={bulkSystemBusy}>
+                  {bulkSystemBusy ? 'Applying…' : 'Apply to All Items'}
+                </Button>
+              </Row>
             </ModalBody>
           </Modal>
         </ModalOverlay>
@@ -1202,6 +1488,101 @@ function ItemField({ label, value }: { label: string; value: string }) {
         overflowY: 'auto',
       }}>
         {value}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Editable system-message field for a single dataset item.
+ *
+ * Always rendered (even when the item has no system message yet) so users can
+ * add one. Tracks a local draft and only enables Save when the draft differs
+ * from the saved value. After saving, the parent re-renders with the new
+ * value as `value`, which resets `draft` via the keyed mount.
+ */
+function EditableSystemField({
+  value,
+  onSave,
+}: {
+  value: string;
+  onSave: (value: string) => Promise<void> | void;
+}) {
+  const [draft, setDraft] = useState(value);
+  const [busy, setBusy] = useState(false);
+  const dirty = draft !== value;
+
+  return (
+    <div>
+      <div
+        style={{
+          fontFamily: tokens.fonts.accent,
+          fontSize: '0.65rem',
+          fontWeight: 600,
+          textTransform: 'uppercase',
+          letterSpacing: '0.5px',
+          color: tokens.colors.text.muted,
+          marginBottom: 4,
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+        }}
+      >
+        <span>System Message</span>
+        {dirty && (
+          <span style={{ color: tokens.colors.accent.primary, textTransform: 'none' }}>
+            (unsaved)
+          </span>
+        )}
+      </div>
+      <textarea
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        placeholder="(no system message — type to add one)"
+        rows={4}
+        style={{
+          width: '100%',
+          fontFamily: tokens.fonts.mono,
+          fontSize: '0.78rem',
+          lineHeight: 1.55,
+          color: tokens.colors.text.primary,
+          background: tokens.colors.bg.primary,
+          border: `1px solid ${dirty ? tokens.colors.accent.primary : tokens.colors.border.subtle}`,
+          borderRadius: tokens.radii.sm,
+          padding: '8px 10px',
+          resize: 'vertical',
+          minHeight: 60,
+          maxHeight: 320,
+          boxSizing: 'border-box',
+        }}
+      />
+      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 6 }}>
+        {dirty && (
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={() => setDraft(value)}
+            disabled={busy}
+            style={{ fontSize: '0.72rem' }}
+          >
+            Cancel
+          </Button>
+        )}
+        <Button
+          size="sm"
+          onClick={async () => {
+            setBusy(true);
+            try {
+              await onSave(draft);
+            } finally {
+              setBusy(false);
+            }
+          }}
+          disabled={!dirty || busy}
+          style={{ fontSize: '0.72rem' }}
+        >
+          {busy ? 'Saving…' : 'Save'}
+        </Button>
       </div>
     </div>
   );

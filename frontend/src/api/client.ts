@@ -38,6 +38,13 @@ export async function apiFetch<T>(path: string, options?: RequestInit): Promise<
     throw new ApiError(message, response.status, body);
   }
   if (response.status === 204) return undefined as T;
+  // Endpoints can return non-JSON (e.g. JSONL, CSV, plain text for exports).
+  // JSON.parse() chokes on JSONL because each line is a separate JSON value,
+  // so honor the response Content-Type instead of forcing JSON parsing.
+  const contentType = response.headers.get('content-type') ?? '';
+  if (!contentType.toLowerCase().includes('application/json')) {
+    return (await response.text()) as T;
+  }
   return response.json();
 }
 

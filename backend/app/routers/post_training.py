@@ -4,6 +4,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import re
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
 from fastapi.responses import PlainTextResponse
@@ -35,9 +36,11 @@ from app.schemas.post_training import (
     ComparisonRunCreate,
     ComparisonRunResponse,
     ComparisonRunWithChildrenResponse,
+    BulkSetSystemRequest,
     DatasetCreate,
     DatasetItemCreate,
     DatasetItemResponse,
+    DatasetItemUpdate,
     DatasetResponse,
     DatasetWithItemsResponse,
     FeedbackItemCreate,
@@ -181,6 +184,80 @@ async def delete_dataset_item(
     await db.flush()
 
 
+@router.patch(
+    f"{PREFIX}/datasets/{{dataset_id}}/items/{{item_id}}",
+    response_model=DatasetItemResponse,
+)
+async def update_dataset_item(
+    project_id: str,
+    dataset_id: str,
+    item_id: str,
+    patch: DatasetItemUpdate,
+    db: AsyncSession = Depends(get_db),
+):
+    """Update one or more fields of a single dataset item.
+
+    Only fields explicitly present in the request body are touched. Pass
+    `null` to clear a field (e.g. `{"system_message": null}` removes it);
+    omit a field to leave it unchanged.
+    """
+    dataset = await db.get(Dataset, dataset_id)
+    if not dataset or dataset.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+
+    item = await db.get(DatasetItem, item_id)
+    if not item or item.dataset_id != dataset_id:
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    updates = patch.model_dump(exclude_unset=True)
+    if "output_text" in updates and updates["output_text"] is None:
+        raise HTTPException(
+            status_code=400,
+            detail="output_text cannot be null",
+        )
+
+    for key, value in updates.items():
+        setattr(item, key, value)
+
+    await db.flush()
+    return item
+
+
+@router.post(f"{PREFIX}/datasets/{{dataset_id}}/items/bulk-set-system")
+async def bulk_set_system_message(
+    project_id: str,
+    dataset_id: str,
+    payload: BulkSetSystemRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Set `system_message` on every item in a dataset.
+
+    Returns `{updated_count, skipped_count}`. When `overwrite=false`, items
+    that already have a non-empty system_message are skipped.
+    """
+    dataset = await db.get(Dataset, dataset_id)
+    if not dataset or dataset.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+
+    result = await db.execute(
+        select(DatasetItem).where(DatasetItem.dataset_id == dataset_id)
+    )
+    items = list(result.scalars().all())
+
+    updated = 0
+    skipped = 0
+    for item in items:
+        has_existing = bool((item.system_message or "").strip())
+        if has_existing and not payload.overwrite:
+            skipped += 1
+            continue
+        item.system_message = payload.system_message
+        updated += 1
+
+    await db.flush()
+    return {"updated_count": updated, "skipped_count": skipped}
+
+
 @router.post(f"{PREFIX}/datasets/{{dataset_id}}/clean")
 async def clean_dataset_endpoint(
     project_id: str,
@@ -265,6 +342,120 @@ async def upload_dataset_file(
     dataset.item_count = dataset.item_count + len(items_to_add)
     await db.flush()
     return dataset
+
+
+# Match a single triple-backtick fence wrapping the ENTIRE string, with an
+# optional language tag (e.g. ```json, ```jsonl, ```python, or just ```).
+# Newlines around the body are optional so this also handles minified single-line
+# fences like ` ```json{"x":1}``` `. Only fully-wrapping fences are stripped —
+# fences embedded mid-text (e.g. inside an explanation) are left alone.
+_FENCE_RE = re.compile(
+    r"^\s*```[a-zA-Z0-9_+-]*\s*\n?(.*?)\n?\s*```\s*$",
+    re.DOTALL,
+)
+
+
+def _strip_code_fences(text: str | None) -> str | None:
+    """Remove a wrapping triple-backtick fence from `text` if present.
+
+    Used at export time so training data doesn't carry markdown code fences
+    that LLMs sometimes emit around their JSON outputs. Returns the input
+    untouched (including None) when no full-wrap fence is found.
+    """
+    if not text:
+        return text
+    match = _FENCE_RE.match(text)
+    if match:
+        return match.group(1).strip()
+    return text
+
+
+@router.get(f"{PREFIX}/datasets/{{dataset_id}}/export")
+async def export_dataset(
+    project_id: str,
+    dataset_id: str,
+    format: str = "alpaca",
+    db: AsyncSession = Depends(get_db),
+):
+    """Export an SFT dataset as a downloadable file.
+
+    Formats:
+    - `alpaca` (default) — JSONL with `{instruction, input, output, system}`
+      keys (round-trips through the upload endpoint).
+    - `messages` — JSONL with OpenAI chat format `{"messages": [...]}`,
+      directly consumable by SFTTrainer / Unsloth / OpenAI fine-tuning.
+    - `csv` — CSV with columns `instruction,input,output,system,tags`.
+
+    All text fields are passed through `_strip_code_fences` so training data
+    doesn't carry ``` ```json ``` ``` wrappers around outputs.
+    """
+    dataset = await db.get(Dataset, dataset_id)
+    if not dataset or dataset.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+
+    result = await db.execute(
+        select(DatasetItem)
+        .where(DatasetItem.dataset_id == dataset_id)
+        .order_by(DatasetItem.created_at.asc())
+    )
+    items = list(result.scalars().all())
+
+    fmt = format.lower()
+
+    if fmt == "alpaca":
+        lines: list[str] = []
+        for it in items:
+            row: dict = {
+                "instruction": _strip_code_fences(it.instruction) or "",
+                "input": _strip_code_fences(it.input_text) or "",
+                "output": _strip_code_fences(it.output_text) or "",
+            }
+            sys_msg = _strip_code_fences(it.system_message)
+            if sys_msg:
+                row["system"] = sys_msg
+            lines.append(json.dumps(row, ensure_ascii=False))
+        body = "\n".join(lines) + ("\n" if lines else "")
+        return PlainTextResponse(body, media_type="application/x-ndjson")
+
+    if fmt == "messages":
+        lines = []
+        for it in items:
+            messages: list[dict] = []
+            sys_msg = _strip_code_fences(it.system_message)
+            if sys_msg:
+                messages.append({"role": "system", "content": sys_msg})
+            instruction = _strip_code_fences(it.instruction) or ""
+            input_text = _strip_code_fences(it.input_text) or ""
+            user_content = instruction
+            if input_text:
+                user_content = f"{user_content}\n\n{input_text}".strip()
+            messages.append({"role": "user", "content": user_content})
+            messages.append({
+                "role": "assistant",
+                "content": _strip_code_fences(it.output_text) or "",
+            })
+            lines.append(json.dumps({"messages": messages}, ensure_ascii=False))
+        body = "\n".join(lines) + ("\n" if lines else "")
+        return PlainTextResponse(body, media_type="application/x-ndjson")
+
+    if fmt == "csv":
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(["instruction", "input", "output", "system", "tags"])
+        for it in items:
+            writer.writerow([
+                _strip_code_fences(it.instruction) or "",
+                _strip_code_fences(it.input_text) or "",
+                _strip_code_fences(it.output_text) or "",
+                _strip_code_fences(it.system_message) or "",
+                it.tags or "",
+            ])
+        return PlainTextResponse(buf.getvalue(), media_type="text/csv")
+
+    raise HTTPException(
+        status_code=400,
+        detail=f"Unknown format: {format!r}. Use alpaca, messages, or csv.",
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

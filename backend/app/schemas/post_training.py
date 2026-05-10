@@ -37,6 +37,33 @@ class DatasetItemCreate(BaseModel):
     metadata_json: str | None = None
 
 
+class DatasetItemUpdate(BaseModel):
+    """Partial update for a single DatasetItem.
+
+    All fields are optional and use `model_dump(exclude_unset=True)` semantics
+    on the router side: omitted fields are left untouched, present-but-null
+    fields explicitly clear the column. `output_text` cannot be set to null
+    (NOT NULL in DB) — the router validates this.
+    """
+    instruction: str | None = None
+    input_text: str | None = None
+    output_text: str | None = None
+    system_message: str | None = None
+    tags: str | None = None
+    metadata_json: str | None = None
+
+
+class BulkSetSystemRequest(BaseModel):
+    """Set `system_message` on every item in a dataset.
+
+    - `system_message` may be null to clear.
+    - When `overwrite` is False (default), items that already have a non-empty
+      system_message are left alone.
+    """
+    system_message: str | None
+    overwrite: bool = False
+
+
 class DatasetItemResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

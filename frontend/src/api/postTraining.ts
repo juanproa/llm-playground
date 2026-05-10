@@ -68,6 +68,38 @@ export const postTrainingApi = {
       method: 'DELETE',
     }),
 
+  updateDatasetItem: (
+    projectId: string,
+    datasetId: string,
+    itemId: string,
+    patch: Partial<{
+      instruction: string | null;
+      input_text: string | null;
+      output_text: string;
+      system_message: string | null;
+      tags: string | null;
+      metadata_json: string | null;
+    }>,
+  ) =>
+    apiFetch<DatasetItem>(
+      `${base(projectId)}/datasets/${datasetId}/items/${itemId}`,
+      { method: 'PATCH', body: JSON.stringify(patch) },
+    ),
+
+  bulkSetSystemMessage: (
+    projectId: string,
+    datasetId: string,
+    systemMessage: string | null,
+    overwrite: boolean = false,
+  ) =>
+    apiFetch<{ updated_count: number; skipped_count: number }>(
+      `${base(projectId)}/datasets/${datasetId}/items/bulk-set-system`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ system_message: systemMessage, overwrite }),
+      },
+    ),
+
   cleanDataset: (projectId: string, datasetId: string, opts?: { dedup?: boolean; normalize?: boolean; strip_html?: boolean }) =>
     apiFetch<{
       initial_count: number;
@@ -88,6 +120,15 @@ export const postTrainingApi = {
       body: formData,
     });
   },
+
+  exportDataset: (
+    projectId: string,
+    datasetId: string,
+    format: 'alpaca' | 'messages' | 'csv' = 'alpaca',
+  ) =>
+    apiFetch<string>(
+      `${base(projectId)}/datasets/${datasetId}/export?format=${format}`,
+    ),
 
   // Training Jobs (SFT)
   listTrainingJobs: (projectId: string) =>

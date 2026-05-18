@@ -1,6 +1,7 @@
 import React from 'react';
 import styled from 'styled-components';
 import { tokens } from '../../theme/tokens';
+import { useEscapeKey } from '../../hooks/useEscapeKey';
 
 const Overlay = styled.div`
   position: fixed;
@@ -39,6 +40,7 @@ interface ModalProps {
 }
 
 export function Modal({ title, open, onClose, children, size = 'md' }: ModalProps) {
+  useEscapeKey(onClose, open);
   if (!open) return null;
   return (
     <Overlay onClick={onClose}>

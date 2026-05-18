@@ -29,12 +29,18 @@ class DatasetResponse(BaseModel):
 
 
 class DatasetItemCreate(BaseModel):
+    # `name` and provenance columns are curation metadata, never read by the
+    # training pipeline. See DatasetItem model docstring.
+    name: str | None = None
     instruction: str | None = None
     input_text: str | None = None
     output_text: str
     system_message: str | None = None
     tags: str | None = None
     metadata_json: str | None = None
+    source_test_case_id: str | None = None
+    parent_item_id: str | None = None
+    verified_status: str | None = None
 
 
 class DatasetItemUpdate(BaseModel):
@@ -45,12 +51,16 @@ class DatasetItemUpdate(BaseModel):
     fields explicitly clear the column. `output_text` cannot be set to null
     (NOT NULL in DB) — the router validates this.
     """
+    name: str | None = None
     instruction: str | None = None
     input_text: str | None = None
     output_text: str | None = None
     system_message: str | None = None
     tags: str | None = None
     metadata_json: str | None = None
+    source_test_case_id: str | None = None
+    parent_item_id: str | None = None
+    verified_status: str | None = None
 
 
 class BulkSetSystemRequest(BaseModel):
@@ -69,12 +79,16 @@ class DatasetItemResponse(BaseModel):
 
     id: str
     dataset_id: str
+    name: str | None
     instruction: str | None
     input_text: str | None
     output_text: str
     system_message: str | None
     tags: str | None
     metadata_json: str | None
+    source_test_case_id: str | None
+    parent_item_id: str | None
+    verified_status: str | None
     created_at: datetime
 
 
@@ -484,3 +498,44 @@ class ComparisonRunWithChildrenResponse(ComparisonRunResponse):
     """Full matrix payload — children (columns) × input_items (rows)."""
     input_items: list[ComparisonInputItemResponse] = []
     children: list[ComparisonChildResponse] = []
+
+
+# ─── Synthetic Data Generation (Phase 3) ───────────────────────────────────
+
+class SyntheticJobCreate(BaseModel):
+    """Kick off LLM-driven generation of variations into a NEW dataset.
+
+    The source dataset is never mutated — a brand-new dataset is created and
+    populated as the job runs.
+    """
+    name: str
+    source_dataset_id: str
+    model_config_id: str
+    # Prompt template; the worker substitutes {input_text} and {output_text}
+    # per item before sending to the LLM.
+    variation_prompt: str
+    # Map of tag → variant count. The reserved key "_default" applies to items
+    # with no matching tag. Max wins when an item carries multiple matching
+    # tags. Counts must be ≥ 0; 0 means "skip variants for these items".
+    tag_multipliers: dict[str, int]
+
+
+class SyntheticJobResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    project_id: str
+    name: str
+    source_dataset_id: str | None
+    target_dataset_id: str | None
+    model_config_id: str | None
+    variation_prompt: str
+    tag_multipliers: str  # JSON string — frontend parses
+    status: str
+    total_planned: int
+    completed_count: int
+    failed_count: int
+    error_message: str | None
+    started_at: datetime | None
+    completed_at: datetime | None
+    created_at: datetime

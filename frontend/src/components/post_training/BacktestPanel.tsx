@@ -7,6 +7,7 @@ import { Badge } from '../common/Badge';
 import { postTrainingApi } from '../../api/postTraining';
 import { usePromptStore } from '../../stores/promptStore';
 import { useModelStore } from '../../stores/modelStore';
+import { useEscapeKey } from '../../hooks/useEscapeKey';
 import type { AssertionSpec, BacktestResult, BacktestRun, TestCase } from '../../types';
 import { AssertionsEditor } from './AssertionsEditor';
 import { ExpectedOutputPicker } from './ExpectedOutputPicker';
@@ -562,8 +563,17 @@ export function BacktestPanel({ projectId }: Props) {
   const [addToDatasetDefaults, setAddToDatasetDefaults] = useState<{
     instruction?: string;
     systemMessage?: string;
+    /** Pre-selected reference run for Phase 2 outcome tagging. Carried through
+     *  whenever the user opens the modal from a known run context — e.g.,
+     *  bulk-exporting test cases while a run is selected, or exporting a
+     *  single backtest result. Falls back to "" (no auto-select). */
+    backtestRunId?: string;
   }>({});
   const [showAddToDataset, setShowAddToDataset] = useState(false);
+
+  // Esc-to-close for both BacktestPanel modals.
+  useEscapeKey(() => setShowRunModal(false), showRunModal);
+  useEscapeKey(() => setSelectedRun(null), !!selectedRun);
 
   // New test case form
   const [caseName, setCaseName] = useState('');
@@ -838,9 +848,15 @@ export function BacktestPanel({ projectId }: Props) {
   /** Open the Add-to-SFT modal pre-loaded with the given test cases. */
   function openAddTestCasesToDataset(cases: TestCase[]) {
     if (cases.length === 0) return;
+    // Phase 1: persist the TestCase's name and its id as provenance on each
+    // new DatasetItem. Existing tc.tags survive into the SFT item (the modal
+    // appends any modal-level tags AFTER these).
     const items: AddToDatasetItem[] = cases.map((tc) => ({
+      name: tc.name,
       input_text: tc.input_text,
       output_text: tc.expected_output,
+      source_test_case_id: tc.id,
+      tags: tc.tags || undefined,
       label: tc.name,
     }));
     setAddToDatasetItems(items);
@@ -849,7 +865,12 @@ export function BacktestPanel({ projectId }: Props) {
         ? `Add Test Case "${cases[0].name}" to SFT Dataset`
         : `Add ${cases.length} Test Cases to SFT Dataset`,
     );
-    setAddToDatasetDefaults({});
+    // If a backtest run is open in the right pane, pre-select it as the
+    // outcome-tag reference. The user can still change it (or clear it) in
+    // the modal's dropdown.
+    setAddToDatasetDefaults({
+      backtestRunId: selectedRun?.id,
+    });
     setShowAddToDataset(true);
   }
 
@@ -893,8 +914,17 @@ export function BacktestPanel({ projectId }: Props) {
 
     setAddToDatasetItems([
       {
+        // Persist a readable name on the SFT item. Distinguishes "expected vs
+        // actual" so the user can tell sibling items apart after import.
+        name: `${result.test_case?.name ?? result.test_case_id.slice(0, 8)} — ${
+          useExpected ? 'expected' : 'actual'
+        }`,
         input_text: inputText,
         output_text: outputText,
+        // Provenance: link back to the source TestCase (not the BacktestRun —
+        // run-level pass/fail tagging is the Phase 2 feature).
+        source_test_case_id: result.test_case_id,
+        tags: result.test_case?.tags || undefined,
         label: `${result.test_case?.name ?? result.test_case_id.slice(0, 8)} — ${
           useExpected ? 'expected' : 'actual'
         } output`,
@@ -905,9 +935,13 @@ export function BacktestPanel({ projectId }: Props) {
         ? 'Add Backtest Result (Expected Output) to SFT Dataset'
         : 'Add Backtest Result (Actual Output) to SFT Dataset',
     );
+    // The user is exporting from a specific run's result — that's exactly the
+    // reference run we want the dropdown to default to (so the outcome tags
+    // line up with what they're looking at on screen).
     setAddToDatasetDefaults({
       instruction: defaultInstruction,
       systemMessage: defaultSystemMessage,
+      backtestRunId: selectedRun?.id,
     });
     setShowAddToDataset(true);
   }
@@ -1611,6 +1645,7 @@ export function BacktestPanel({ projectId }: Props) {
         title={addToDatasetTitle}
         defaultInstruction={addToDatasetDefaults.instruction}
         defaultSystemMessage={addToDatasetDefaults.systemMessage}
+        defaultBacktestRunId={addToDatasetDefaults.backtestRunId}
       />
     </Layout>
   );

@@ -100,6 +100,16 @@ def _run_migrations(conn) -> None:
         ("chain_runs", "input_override", "ALTER TABLE chain_runs ADD COLUMN input_override TEXT"),
         # Display label for Batch Compare rows, copied from InputDatasetItem.name at create time.
         ("pt_comparison_input_items", "name", "ALTER TABLE pt_comparison_input_items ADD COLUMN name VARCHAR(255)"),
+        # SFT DatasetItem enrichment (Phase 1): per-item label + provenance back-link
+        # to TestCase, plus a self-link reserved for synthetic-data Phase 3.
+        # These are curation/analysis metadata only — NOT written to training JSONL.
+        ("pt_dataset_items", "name", "ALTER TABLE pt_dataset_items ADD COLUMN name VARCHAR(255)"),
+        ("pt_dataset_items", "source_test_case_id", "ALTER TABLE pt_dataset_items ADD COLUMN source_test_case_id VARCHAR(36)"),
+        ("pt_dataset_items", "parent_item_id", "ALTER TABLE pt_dataset_items ADD COLUMN parent_item_id VARCHAR(36)"),
+        # Phase 3 (synthetic data): per-variant verification state. Null for
+        # non-synthetic items. The pt_synthetic_jobs table itself is created
+        # by Base.metadata.create_all (brand-new table, not an ALTER).
+        ("pt_dataset_items", "verified_status", "ALTER TABLE pt_dataset_items ADD COLUMN verified_status VARCHAR(20)"),
     ]
     for table, column, ddl in migrations:
         try:

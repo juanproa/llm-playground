@@ -94,11 +94,44 @@ export interface Dataset {
 export interface DatasetItem {
   id: string;
   dataset_id: string;
+  // `name`, `tags`, and provenance columns are curation/analysis metadata —
+  // never written to the training JSONL. See backend DatasetItem model.
+  name: string | null;
   instruction: string | null;
   input_text: string | null;
   output_text: string;
   system_message: string | null;
   tags: string | null;
+  // Soft link to the TestCase this item was exported from. Set by BacktestPanel's
+  // "+ Add to SFT" flow. Null for hand-curated items.
+  source_test_case_id: string | null;
+  // Self-link for synthetic items (Phase 3). Null for non-synthetic items.
+  parent_item_id: string | null;
+  // 'unverified' on synthetic items at creation; null on hand-curated.
+  // A future "Verify Synthetic Dataset" action would flip to 'verified' /
+  // 'rejected' after re-running each variant through the source prompt.
+  verified_status: string | null;
+  created_at: string;
+}
+
+export interface SyntheticJob {
+  id: string;
+  project_id: string;
+  name: string;
+  source_dataset_id: string | null;
+  target_dataset_id: string | null;
+  model_config_id: string | null;
+  variation_prompt: string;
+  // JSON string of {tag: count, "_default": N}. Frontend parses for editing.
+  tag_multipliers: string;
+  // 'pending' | 'running' | 'completed' | 'failed' | 'cancelling' | 'cancelled'
+  status: string;
+  total_planned: number;
+  completed_count: number;
+  failed_count: number;
+  error_message: string | null;
+  started_at: string | null;
+  completed_at: string | null;
   created_at: string;
 }
 

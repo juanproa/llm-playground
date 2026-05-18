@@ -4,6 +4,7 @@ import { tokens } from '../../theme/tokens';
 import { Badge } from '../common/Badge';
 import { Button } from '../common/Button';
 import type { SlotState } from '../../hooks/useComparisonInference';
+import { useEscapeKey } from '../../hooks/useEscapeKey';
 import type { ModelConfig } from '../../types';
 import { parseThinking, stripThinkingFromStream } from '../../utils/thinkingFilter';
 
@@ -257,6 +258,10 @@ export function ComparisonModal({ open, onClose, onStop, slots, models, isActive
     }
     requestAnimationFrame(() => { scrollingRef.current = false; });
   }, [syncScroll]);
+
+  // Esc closes the modal — but not while inference is still streaming
+  // (otherwise the user loses in-flight output without an explicit Stop).
+  useEscapeKey(onClose, open && !isActive);
 
   if (!open) return null;
 

@@ -7,7 +7,8 @@ import { postTrainingApi } from '../../api/postTraining';
 import { inferenceApi } from '../../api/inference';
 import { modelsApi } from '../../api/models';
 import { promptsApi } from '../../api/prompts';
-import type { ArtifactInfo, Dataset, HfModelInfo, InferenceRun, MlxModelInfo, ModelConfig, Prompt, TrainingBackendInfo, TrainingJob } from '../../types';
+import { useEscapeKey } from '../../hooks/useEscapeKey';
+import type { ArtifactInfo, Dataset, HfModelInfo, InferenceRun, MlxModelInfo, ModelConfig, Prompt, SyntheticJob, TrainingBackendInfo, TrainingJob } from '../../types';
 import type { DatasetWithItems } from '../../api/postTraining';
 import { LossChart } from './LossChart';
 
@@ -295,12 +296,78 @@ function getJobBadgeColor(status: string): 'primary' | 'success' | 'error' | 'se
   }
 }
 
+// Split a comma-separated tags string into structured pieces so the renderer
+// can pull out the backtest-outcome tags as colored Badges instead of leaving
+// them buried in a flat comma list. Phase 2 of the Backtest→SFT pipeline tags
+// items with `bt:passed`/`bt:failed`/`bt:not_evaluated` plus `bt_run:<short>`,
+// and those are the curation signals the user is scanning for at a glance.
+//
+// Anything that isn't a recognised `bt:`/`bt_run:` token falls back into
+// `others` and renders as muted text — so user-added tags don't change.
+type ParsedTags = {
+  outcome: 'passed' | 'failed' | 'not_evaluated' | null;
+  runShortId: string | null;
+  others: string[];
+};
+
+// Starter variation prompts for Phase 3 synthetic generation. The backend
+// substitutes {input_text} and {output_text} per item before sending. Each
+// template tells the LLM what the variation must STILL produce so it can't
+// invent new ground truth — that's the rule that keeps synthetic data from
+// poisoning the trainer.
+const SYNTHETIC_PROMPT_TEMPLATES = {
+  paraphrase: `Rewrite the input below preserving every entity, fact, and intent. Vary phrasing, sentence order, and formality. The expected output must still be:
+
+{output_text}
+
+Original input:
+{input_text}
+
+Output ONLY the rewritten input — no preamble, no markdown fences, no explanation.`,
+  domainShift: `Rewrite this input as if it described the same scenario but in a different setting — different hospital / state / specialty / payer / case manager. Preserve every fact relevant to the expected output:
+
+{output_text}
+
+Original input:
+{input_text}
+
+Output ONLY the rewritten input — no preamble, no markdown fences, no explanation.`,
+  harder: `Rewrite this input to be a more ambiguous, noisier, or harder-to-classify version of the same scenario. Add hedging language, partial information, or formatting noise. The expected output must remain:
+
+{output_text}
+
+Original input:
+{input_text}
+
+Output ONLY the rewritten input — no preamble, no markdown fences, no explanation.`,
+} as const;
+
+
+function parseTags(raw: string | null | undefined): ParsedTags {
+  if (!raw) return { outcome: null, runShortId: null, others: [] };
+  const tokens = raw.split(',').map((s) => s.trim()).filter(Boolean);
+  let outcome: ParsedTags['outcome'] = null;
+  let runShortId: ParsedTags['runShortId'] = null;
+  const others: string[] = [];
+  for (const t of tokens) {
+    if (t === 'bt:passed') outcome = 'passed';
+    else if (t === 'bt:failed') outcome = 'failed';
+    else if (t === 'bt:not_evaluated') outcome = 'not_evaluated';
+    else if (t.startsWith('bt_run:')) runShortId = t.slice('bt_run:'.length);
+    else others.push(t);
+  }
+  return { outcome, runShortId, others };
+}
+
 // ─── Component ────────────────────────────────────────────────────────────────
 
 export function SFTPanel({ projectId }: Props) {
   const [datasets, setDatasets] = useState<Dataset[]>([]);
   const [trainingJobs, setTrainingJobs] = useState<TrainingJob[]>([]);
   const [, setOllamaModels] = useState<ModelConfig[]>([]);
+  // All enabled models, for the synthetic-generation modal (which can use
+  // any provider, not just Ollama).
+  const [allEnabledModels, setAllEnabledModels] = useState<ModelConfig[]>([]);
   const [selectedDataset, setSelectedDataset] = useState<Dataset | null>(null);
   const [selectedJob, setSelectedJob] = useState<TrainingJob | null>(null);
   const [showJobModal, setShowJobModal] = useState(false);
@@ -324,6 +391,35 @@ export function SFTPanel({ projectId }: Props) {
   const [bulkSystemMessage, setBulkSystemMessage] = useState('');
   const [bulkSystemOverwrite, setBulkSystemOverwrite] = useState(false);
   const [bulkSystemBusy, setBulkSystemBusy] = useState(false);
+
+  // Phase 3: Synthetic Data Generation modal + in-flight job list.
+  const [synthSource, setSynthSource] = useState<Dataset | null>(null);
+  const [synthName, setSynthName] = useState('');
+  const [synthModelId, setSynthModelId] = useState('');
+  const [synthPrompt, setSynthPrompt] = useState('');
+  // Editable per-tag table: rows are [tag, count]. First row is always
+  // `_default`. Other rows are auto-seeded from tags present in source items.
+  const [synthMultipliers, setSynthMultipliers] = useState<Array<{ tag: string; count: number }>>([
+    { tag: '_default', count: 1 },
+  ]);
+  const [synthStarting, setSynthStarting] = useState(false);
+  const [synthError, setSynthError] = useState<string | null>(null);
+  // Tag distribution in the source dataset — drives both the multiplier
+  // table's auto-suggestions and the live "will generate N variants" preview.
+  const [synthSourceTagCounts, setSynthSourceTagCounts] = useState<Map<string, number>>(new Map());
+  const [synthSourceItemCount, setSynthSourceItemCount] = useState<number>(0);
+
+  // List of synthetic jobs for this project. Polled every 3s while any are
+  // pending/running/cancelling (mirrors BacktestPanel polling pattern).
+  const [syntheticJobs, setSyntheticJobs] = useState<SyntheticJob[]>([]);
+
+  // Esc-to-close for each of SFTPanel's modals. `addingRuns` / `bulkSystemBusy`
+  // gate the Run-add and Bulk-system dialogs so an in-flight save isn't dropped.
+  useEscapeKey(() => setShowRunsModal(false), showRunsModal && !addingRuns);
+  useEscapeKey(() => setShowJobModal(false), showJobModal);
+  useEscapeKey(() => setViewDataset(null), !!viewDataset);
+  useEscapeKey(() => setBulkSystemDataset(null), !!bulkSystemDataset && !bulkSystemBusy);
+  useEscapeKey(() => setSynthSource(null), !!synthSource && !synthStarting);
   // Project prompts available as starting templates in the bulk modal.
   const [projectPrompts, setProjectPrompts] = useState<Prompt[]>([]);
   const [pickedPromptKey, setPickedPromptKey] = useState('');
@@ -358,6 +454,35 @@ export function SFTPanel({ projectId }: Props) {
     loadArtifacts();
   }, [projectId]);
 
+  // Poll synthetic jobs every 3s while any are in-flight so the progress
+  // counters update live. Mirrors BacktestPanel's pattern. Also refreshes
+  // the dataset list when a job finishes so the target's item_count settles.
+  const anySyntheticInFlight = syntheticJobs.some(
+    (j) => j.status === 'pending' || j.status === 'running' || j.status === 'cancelling',
+  );
+  useEffect(() => {
+    if (!anySyntheticInFlight) return;
+    let lastSeenTerminal = 0;
+    const interval = setInterval(async () => {
+      try {
+        const next = await postTrainingApi.listSyntheticJobs(projectId);
+        setSyntheticJobs(next);
+        const terminalCount = next.filter(
+          (j) => j.status === 'completed' || j.status === 'failed' || j.status === 'cancelled',
+        ).length;
+        // If a job just transitioned to terminal, refresh datasets so the
+        // target's final item_count is reflected.
+        if (terminalCount > lastSeenTerminal) {
+          lastSeenTerminal = terminalCount;
+          postTrainingApi.listDatasets(projectId).then(setDatasets).catch(() => {});
+        }
+      } catch {
+        // Transient errors are fine — keep polling.
+      }
+    }, 3000);
+    return () => clearInterval(interval);
+  }, [anySyntheticInFlight, projectId]);
+
   async function loadCatalogs() {
     try {
       const [backends, mlx, hf] = await Promise.all([
@@ -388,14 +513,17 @@ export function SFTPanel({ projectId }: Props) {
 
   async function loadData() {
     try {
-      const [ds, jobs, models] = await Promise.all([
+      const [ds, jobs, models, synthJobs] = await Promise.all([
         postTrainingApi.listDatasets(projectId),
         postTrainingApi.listTrainingJobs(projectId),
         modelsApi.list(),
+        postTrainingApi.listSyntheticJobs(projectId).catch(() => [] as SyntheticJob[]),
       ]);
       setDatasets(ds);
       setTrainingJobs(jobs);
       setOllamaModels(models.filter((m) => m.provider === 'ollama' && m.is_enabled));
+      setAllEnabledModels(models.filter((m) => m.is_enabled));
+      setSyntheticJobs(synthJobs);
     } catch {
       // silently fail
     }
@@ -534,6 +662,153 @@ export function SFTPanel({ projectId }: Props) {
       alert((e as Error).message);
     } finally {
       setBulkSystemBusy(false);
+    }
+  }
+
+  // ─── Phase 3: synthetic data ────────────────────────────────────────────
+
+  async function openSyntheticModal(dataset: Dataset) {
+    // Reset modal state and fetch full source dataset to scan tag distribution.
+    setSynthSource(dataset);
+    setSynthName(`${dataset.name} – Synthetic – ${new Date().toLocaleDateString()}`);
+    setSynthModelId('');
+    setSynthPrompt(SYNTHETIC_PROMPT_TEMPLATES.paraphrase);
+    setSynthError(null);
+    setSynthSourceTagCounts(new Map());
+    setSynthSourceItemCount(0);
+    setSynthMultipliers([{ tag: '_default', count: 1 }]);
+
+    try {
+      const full = await postTrainingApi.getDataset(projectId, dataset.id);
+      const counts = new Map<string, number>();
+      for (const item of full.items) {
+        const tokens = parseTags(item.tags);
+        // Count each distinct token presence (not duplicates within a single item).
+        const seen = new Set(tokens.outcome ? [`bt:${tokens.outcome}`] : []);
+        if (tokens.runShortId) seen.add(`bt_run:${tokens.runShortId}`);
+        for (const t of tokens.others) seen.add(t);
+        for (const t of seen) counts.set(t, (counts.get(t) || 0) + 1);
+      }
+      setSynthSourceTagCounts(counts);
+      setSynthSourceItemCount(full.items.length);
+      // Auto-seed multiplier rows for the 5 most-common tags so the user has
+      // something to edit rather than starting from an empty list.
+      const topTags = Array.from(counts.entries())
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 5)
+        .map(([tag]) => ({ tag, count: 1 }));
+      setSynthMultipliers([{ tag: '_default', count: 1 }, ...topTags]);
+    } catch {
+      // Non-fatal — modal still works with only the _default row.
+    }
+  }
+
+  function addSynthMultiplierRow() {
+    setSynthMultipliers((prev) => [...prev, { tag: '', count: 1 }]);
+  }
+
+  function updateSynthMultiplierRow(idx: number, patch: Partial<{ tag: string; count: number }>) {
+    setSynthMultipliers((prev) => prev.map((r, i) => (i === idx ? { ...r, ...patch } : r)));
+  }
+
+  function removeSynthMultiplierRow(idx: number) {
+    setSynthMultipliers((prev) => prev.filter((_, i) => i !== idx));
+  }
+
+  // Mirrors the backend's max-wins logic so we can show a live preview of how
+  // many variants the user's table would produce against the source's tag
+  // distribution. The numbers won't exactly match the backend's
+  // (because here we only know tag *presence counts*, not the per-item tag
+  // sets), so we compute a tight upper bound: for each tag in the table,
+  // count items that have it. Sum after de-duplicating items via max-wins.
+  const synthPlanPreview = (() => {
+    if (!synthSource) return null;
+    const mult: Record<string, number> = {};
+    for (const r of synthMultipliers) {
+      if (r.tag.trim()) mult[r.tag.trim()] = Math.max(0, r.count | 0);
+    }
+    const defaultCount = mult['_default'] ?? 1;
+    // Upper bound: count items hit by each non-default tag, assuming each
+    // such item picks the max of its matching multipliers. We over-count when
+    // an item carries multiple matching tags, so this is approximate.
+    let withMatchingTag = 0;
+    let estimatedVariants = 0;
+    const seenItemsApprox = new Set<string>();
+    // Per-tag contribution (just for display): sum count_in_source × multiplier
+    const perTagContribution: Array<{ tag: string; items: number; count: number; variants: number }> = [];
+    for (const [tag, n] of Object.entries(mult)) {
+      if (tag === '_default') continue;
+      const itemsWithTag = synthSourceTagCounts.get(tag) || 0;
+      perTagContribution.push({ tag, items: itemsWithTag, count: n, variants: itemsWithTag * n });
+      withMatchingTag += itemsWithTag;
+      estimatedVariants += itemsWithTag * n;
+      for (let i = 0; i < itemsWithTag; i++) seenItemsApprox.add(`${tag}:${i}`);
+    }
+    const itemsHittingDefault = Math.max(0, synthSourceItemCount - withMatchingTag);
+    const defaultContribution = itemsHittingDefault * defaultCount;
+    estimatedVariants += defaultContribution;
+    return {
+      perTag: perTagContribution,
+      defaultCount,
+      itemsHittingDefault,
+      defaultContribution,
+      // Approximate — backend computes the true value with max-wins.
+      estimatedVariants,
+    };
+  })();
+
+  async function handleStartSynthetic() {
+    if (!synthSource) return;
+    if (!synthName.trim()) { setSynthError('Name is required.'); return; }
+    if (!synthModelId) { setSynthError('Pick a model.'); return; }
+    if (!synthPrompt.trim()) { setSynthError('Variation prompt is required.'); return; }
+
+    // Collapse the rows into a {tag: count} map. Empty tag rows are dropped.
+    const tagMultipliers: Record<string, number> = {};
+    for (const r of synthMultipliers) {
+      const key = r.tag.trim();
+      if (!key) continue;
+      tagMultipliers[key] = Math.max(0, r.count | 0);
+    }
+    if (!('_default' in tagMultipliers)) tagMultipliers['_default'] = 1;
+
+    setSynthStarting(true);
+    setSynthError(null);
+    try {
+      const job = await postTrainingApi.createSyntheticJob(projectId, {
+        name: synthName.trim(),
+        source_dataset_id: synthSource.id,
+        model_config_id: synthModelId,
+        variation_prompt: synthPrompt,
+        tag_multipliers: tagMultipliers,
+      });
+      setSyntheticJobs((prev) => [job, ...prev]);
+      setSynthSource(null);
+      // Refresh dataset list so the new target dataset shows up immediately
+      // (empty, with item_count climbing as the job runs).
+      await loadData();
+    } catch (e) {
+      setSynthError((e as Error).message || 'Failed to start job');
+    } finally {
+      setSynthStarting(false);
+    }
+  }
+
+  async function handleCancelSyntheticJob(jobId: string) {
+    try {
+      const updated = await postTrainingApi.cancelSyntheticJob(projectId, jobId);
+      setSyntheticJobs((prev) => prev.map((j) => (j.id === jobId ? updated : j)));
+    } catch (e) {
+      alert(`Cancel failed: ${(e as Error).message}`);
+    }
+  }
+
+  async function handleDeleteSyntheticJob(jobId: string) {
+    try {
+      await postTrainingApi.deleteSyntheticJob(projectId, jobId);
+      setSyntheticJobs((prev) => prev.filter((j) => j.id !== jobId));
+    } catch (e) {
+      alert(`Delete failed: ${(e as Error).message}`);
     }
   }
 
@@ -750,6 +1025,58 @@ export function SFTPanel({ projectId }: Props) {
           </Button>
         </PanelHeader>
         <PanelBody>
+          {/* In-flight synthetic jobs: only show non-terminal ones; user
+              can dismiss terminal ones explicitly via the row's ✕ button. */}
+          {syntheticJobs.length > 0 && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 8 }}>
+              {syntheticJobs.map((job) => {
+                const inFlight = job.status === 'pending' || job.status === 'running' || job.status === 'cancelling';
+                const progress = job.total_planned > 0
+                  ? `${job.completed_count}/${job.total_planned}`
+                  : `${job.completed_count}`;
+                const badgeColor: 'primary' | 'success' | 'error' | 'secondary' | 'warning' =
+                  job.status === 'completed' ? 'success'
+                  : job.status === 'failed' ? 'error'
+                  : job.status === 'cancelled' ? 'secondary'
+                  : job.status === 'cancelling' ? 'warning'
+                  : 'primary';
+                return (
+                  <Card key={job.id} style={{ padding: 8 }}>
+                    <Row style={{ alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+                      <div style={{ flex: 1, minWidth: 0, overflow: 'hidden' }}>
+                        <div style={{ fontSize: '0.85rem', fontWeight: 600, color: tokens.colors.text.primary, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                          ⚗ {job.name}
+                        </div>
+                        <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 2 }}>
+                          <Badge color={badgeColor}>{job.status}</Badge>
+                          <span style={{ fontFamily: tokens.fonts.mono, fontSize: '0.72rem', color: tokens.colors.text.muted }}>
+                            {progress} variants
+                            {job.failed_count > 0 && ` · ${job.failed_count} failed`}
+                          </span>
+                        </div>
+                        {job.error_message && (
+                          <div style={{ fontSize: '0.72rem', color: tokens.colors.accent.error, marginTop: 2 }}>
+                            {job.error_message}
+                          </div>
+                        )}
+                      </div>
+                      <Row>
+                        {inFlight ? (
+                          <Button size="sm" variant="danger" onClick={() => handleCancelSyntheticJob(job.id)}>
+                            Cancel
+                          </Button>
+                        ) : (
+                          <Button size="sm" variant="ghost" onClick={() => handleDeleteSyntheticJob(job.id)} title="Remove this job entry (does NOT delete the generated dataset)">
+                            ✕
+                          </Button>
+                        )}
+                      </Row>
+                    </Row>
+                  </Card>
+                );
+              })}
+            </div>
+          )}
           {showDatasetForm && (
             <Card $selected>
               <FormGroup>
@@ -841,6 +1168,14 @@ export function SFTPanel({ projectId }: Props) {
                   title="Set the system message on every item in this dataset"
                 >
                   Set System
+                </Button>
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  onClick={(e) => { e.stopPropagation(); openSyntheticModal(ds); }}
+                  title="Generate LLM-driven variations into a new dataset (non-destructive)"
+                >
+                  + Synthetic
                 </Button>
                 <Button
                   size="sm"
@@ -1251,9 +1586,67 @@ export function SFTPanel({ projectId }: Props) {
                               fontSize: '0.75rem',
                               color: tokens.colors.text.muted,
                               marginBottom: 2,
+                              display: 'flex',
+                              gap: 8,
+                              alignItems: 'center',
+                              flexWrap: 'wrap',
                             }}>
-                              #{idx + 1}
-                              {item.tags && <> · tags: {item.tags}</>}
+                              <span>#{idx + 1}</span>
+                              {item.name && (
+                                <strong
+                                  style={{
+                                    color: tokens.colors.text.primary,
+                                    fontWeight: 600,
+                                  }}
+                                  title={item.name}
+                                >
+                                  {item.name}
+                                </strong>
+                              )}
+                              {item.source_test_case_id && (
+                                <span
+                                  title={`Exported from TestCase ${item.source_test_case_id}`}
+                                  style={{ color: tokens.colors.text.muted }}
+                                >
+                                  · from TC: {item.source_test_case_id.slice(0, 8)}
+                                </span>
+                              )}
+                              {/* Outcome badges from backtest provenance. Pull bt:passed/failed
+                                  out of the flat tag string so they render as colored chips
+                                  the user can scan at a glance — that's the whole point of
+                                  Phase 2 outcome tagging. Plain user tags stay as muted text. */}
+                              {(() => {
+                                const parsed = parseTags(item.tags);
+                                return (
+                                  <>
+                                    {parsed.outcome === 'passed' && (
+                                      <Badge color="success" title="bt:passed (from a referenced backtest run)">
+                                        ✓ passed
+                                      </Badge>
+                                    )}
+                                    {parsed.outcome === 'failed' && (
+                                      <Badge color="error" title="bt:failed (from a referenced backtest run)">
+                                        ✗ failed
+                                      </Badge>
+                                    )}
+                                    {parsed.outcome === 'not_evaluated' && (
+                                      <Badge color="secondary" title="bt:not_evaluated — referenced run had no usable result for this test case">
+                                        not evaluated
+                                      </Badge>
+                                    )}
+                                    {parsed.runShortId && (
+                                      <Badge color="secondary" title={`bt_run:${parsed.runShortId}`}>
+                                        run: {parsed.runShortId}
+                                      </Badge>
+                                    )}
+                                    {parsed.others.length > 0 && (
+                                      <span title={`tags: ${parsed.others.join(', ')}`}>
+                                        · tags: {parsed.others.join(', ')}
+                                      </span>
+                                    )}
+                                  </>
+                                );
+                              })()}
                             </div>
                             <div style={{
                               fontFamily: tokens.fonts.mono,
@@ -1447,6 +1840,178 @@ export function SFTPanel({ projectId }: Props) {
                 </Button>
                 <Button size="sm" onClick={handleApplyBulkSystem} disabled={bulkSystemBusy}>
                   {bulkSystemBusy ? 'Applying…' : 'Apply to All Items'}
+                </Button>
+              </Row>
+            </ModalBody>
+          </Modal>
+        </ModalOverlay>
+      )}
+
+      {/* ─── Phase 3: Generate Synthetic Variations modal ─────────────────── */}
+      {synthSource && (
+        <ModalOverlay onClick={() => !synthStarting && setSynthSource(null)}>
+          <Modal onClick={(e) => e.stopPropagation()} style={{ width: 820, maxHeight: '92vh' }}>
+            <ModalHeader>
+              <div>
+                <ModalTitle>Generate Synthetic — {synthSource.name}</ModalTitle>
+                <CardMeta style={{ marginTop: 4 }}>
+                  Source has {synthSourceItemCount || synthSource.item_count} items. Variants land in a NEW
+                  dataset; the source is untouched.
+                </CardMeta>
+              </div>
+              <Button size="sm" variant="ghost" onClick={() => setSynthSource(null)} disabled={synthStarting}>
+                Close
+              </Button>
+            </ModalHeader>
+            <ModalBody>
+              <FormGroup>
+                <Label>Target Dataset Name</Label>
+                <Input
+                  value={synthName}
+                  onChange={(e) => setSynthName(e.target.value)}
+                  placeholder="e.g. Cases – Synthetic – 2026-05-17"
+                />
+              </FormGroup>
+
+              <FormGroup>
+                <Label>Generation Model</Label>
+                <Select value={synthModelId} onChange={(e) => setSynthModelId(e.target.value)}>
+                  <option value="">— pick an enabled model —</option>
+                  {allEnabledModels.map((m) => (
+                    <option key={m.id} value={m.id}>
+                      {m.name} ({m.provider})
+                    </option>
+                  ))}
+                </Select>
+                <CardMeta style={{ marginTop: 4 }}>
+                  Any enabled model works; remote frontier models (Gemini Flash, Claude Haiku) produce
+                  the best paraphrases. Local/quantized models are cheaper but more error-prone.
+                </CardMeta>
+              </FormGroup>
+
+              <FormGroup>
+                <Label>Variants per item · by tag</Label>
+                <CardMeta style={{ marginBottom: 6 }}>
+                  When an item carries multiple matching tags, the highest count wins (max-wins).
+                  Items with no matching tag fall back to <code>_default</code>. Counts of 0 skip
+                  the item entirely. Tag counts on the right show items in source carrying that tag.
+                </CardMeta>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                  {synthMultipliers.map((row, idx) => {
+                    const itemsWithTag = row.tag === '_default'
+                      ? synthSourceItemCount
+                      : (synthSourceTagCounts.get(row.tag.trim()) || 0);
+                    const isDefault = row.tag === '_default';
+                    return (
+                      <div key={idx} style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                        <Input
+                          value={row.tag}
+                          onChange={(e) => updateSynthMultiplierRow(idx, { tag: e.target.value })}
+                          placeholder="tag name (e.g. bt:failed)"
+                          disabled={isDefault}
+                          style={{ flex: 1, fontFamily: tokens.fonts.mono, fontSize: '0.82rem' }}
+                        />
+                        <Input
+                          type="number"
+                          min={0}
+                          value={String(row.count)}
+                          onChange={(e) => updateSynthMultiplierRow(idx, { count: Math.max(0, Number(e.target.value) | 0) })}
+                          style={{ width: 80 }}
+                        />
+                        <span style={{ width: 80, fontSize: '0.75rem', color: tokens.colors.text.muted }}>
+                          {itemsWithTag} items
+                        </span>
+                        {!isDefault ? (
+                          <Button size="sm" variant="ghost" onClick={() => removeSynthMultiplierRow(idx)}>
+                            ✕
+                          </Button>
+                        ) : (
+                          <div style={{ width: 30 }} />
+                        )}
+                      </div>
+                    );
+                  })}
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    style={{ alignSelf: 'flex-start' }}
+                    onClick={addSynthMultiplierRow}
+                  >
+                    + Add tag row
+                  </Button>
+                </div>
+                {synthPlanPreview && (
+                  <div style={{
+                    marginTop: 8,
+                    padding: '8px 10px',
+                    background: tokens.colors.bg.primary,
+                    border: `1px solid ${tokens.colors.border.subtle}`,
+                    borderRadius: tokens.radii.sm,
+                    fontSize: '0.78rem',
+                    color: tokens.colors.text.secondary,
+                  }}>
+                    Will generate roughly <strong style={{ color: tokens.colors.text.primary }}>
+                      {synthPlanPreview.estimatedVariants}
+                    </strong> variants
+                    {synthPlanPreview.perTag.length > 0 && ' (' +
+                      synthPlanPreview.perTag.map((p) => `${p.tag}: ${p.variants}`).join(', ')
+                      + `, default: ${synthPlanPreview.defaultContribution}` +
+                      ')'}
+                    . The exact count is computed server-side with max-wins per item.
+                  </div>
+                )}
+              </FormGroup>
+
+              <FormGroup>
+                <Label>Variation Prompt</Label>
+                <Row style={{ marginBottom: 4 }}>
+                  <Button size="sm" variant="ghost" onClick={() => setSynthPrompt(SYNTHETIC_PROMPT_TEMPLATES.paraphrase)}>
+                    Paraphrase
+                  </Button>
+                  <Button size="sm" variant="ghost" onClick={() => setSynthPrompt(SYNTHETIC_PROMPT_TEMPLATES.domainShift)}>
+                    Domain shift
+                  </Button>
+                  <Button size="sm" variant="ghost" onClick={() => setSynthPrompt(SYNTHETIC_PROMPT_TEMPLATES.harder)}>
+                    Harder edge case
+                  </Button>
+                </Row>
+                <textarea
+                  value={synthPrompt}
+                  onChange={(e) => setSynthPrompt(e.target.value)}
+                  rows={10}
+                  style={{
+                    width: '100%',
+                    fontFamily: tokens.fonts.mono,
+                    fontSize: '0.78rem',
+                    lineHeight: 1.5,
+                    background: tokens.colors.bg.primary,
+                    color: tokens.colors.text.primary,
+                    border: `1px solid ${tokens.colors.border.subtle}`,
+                    borderRadius: tokens.radii.sm,
+                    padding: '8px 10px',
+                    resize: 'vertical',
+                    boxSizing: 'border-box',
+                  }}
+                />
+                <CardMeta style={{ marginTop: 4 }}>
+                  Use <code>{'{input_text}'}</code> and <code>{'{output_text}'}</code> placeholders.
+                  The expected output is included so the LLM has a fixed target the variation must
+                  still produce — without that, the variant can drift into wrong-answer territory.
+                </CardMeta>
+              </FormGroup>
+
+              {synthError && (
+                <div style={{ color: tokens.colors.accent.error, fontSize: '0.85rem' }}>
+                  {synthError}
+                </div>
+              )}
+
+              <Row>
+                <Button onClick={handleStartSynthetic} disabled={synthStarting}>
+                  {synthStarting ? 'Starting…' : 'Start Generation'}
+                </Button>
+                <Button variant="ghost" onClick={() => setSynthSource(null)} disabled={synthStarting}>
+                  Cancel
                 </Button>
               </Row>
             </ModalBody>

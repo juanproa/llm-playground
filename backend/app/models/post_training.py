@@ -32,12 +32,31 @@ class DatasetItem(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     dataset_id: Mapped[str] = mapped_column(String(36), ForeignKey("pt_datasets.id"), nullable=False)
+    # Human-readable label for curation only — NOT written to training JSONL.
+    # See sft_service._write_jsonl: only instruction/input_text/output_text/
+    # system_message are emitted. `name`, `tags`, and provenance columns are
+    # purely for "which item is this / where did it come from" analysis.
+    name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     instruction: Mapped[str | None] = mapped_column(Text, nullable=True)
     input_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     output_text: Mapped[str] = mapped_column(Text, nullable=False)
     system_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     tags: Mapped[str | None] = mapped_column(Text, nullable=True)  # comma-separated
     metadata_json: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON
+    # Soft link to the TestCase this item was exported from. Intentionally NOT
+    # a FK — the TestCase may be deleted while keeping its downstream SFT
+    # items alive. Same pattern as TestCase.source_input_dataset_item_id.
+    source_test_case_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    # Self-link for synthetic items: when the synthetic-data module generates
+    # variants of an item, each variant points back to its parent via this
+    # column. Soft link (no FK) so deletes don't cascade silently. Null for
+    # hand-curated items.
+    parent_item_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    # Verification state for synthetic items. Set to 'unverified' at creation;
+    # a follow-up "Verify Synthetic Dataset" action would re-run each variant
+    # through the source prompt+model and flip this to 'verified' / 'rejected'.
+    # Null for non-synthetic items (no verification concept applies).
+    verified_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     dataset = relationship("Dataset", back_populates="items")
@@ -69,6 +88,51 @@ class TrainingJob(Base):
 
     project = relationship("Project")
     dataset = relationship("Dataset", back_populates="training_jobs")
+
+
+# ─── SFT: Synthetic Data Generation ────────────────────────────────────────
+
+class SyntheticJob(Base):
+    """Background job that generates LLM-driven variations of an SFT dataset.
+
+    Each job reads from `source_dataset_id`, generates 1..N variants per item
+    (the count is decided by `tag_multipliers` against each item's tags), and
+    writes the variants into a brand-new `target_dataset_id`. The source is
+    never mutated — synthetic data is risky (distribution shift, model
+    collapse), so non-destructive duplication is the contract.
+
+    Status lifecycle:
+        pending → running → completed | failed
+                          → cancelling → cancelled (cooperative cancel)
+    """
+    __tablename__ = "pt_synthetic_jobs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    project_id: Mapped[str] = mapped_column(String(36), ForeignKey("projects.id"), nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Soft links — no FK so deleting a dataset leaves an audit trail
+    # ("we generated FROM dataset X on date Y, which now no longer exists").
+    source_dataset_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    target_dataset_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    model_config_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    # The full prompt template, user-edited. Supports {input_text} and
+    # {output_text} placeholders that the worker substitutes per item.
+    variation_prompt: Mapped[str] = mapped_column(Text, nullable=False)
+    # JSON: {"_default": 1, "bt:failed": 5, "bt:passed": 0, ...}.
+    # When an item carries multiple matching tags, max wins. Items with no
+    # matching tag fall back to `_default`.
+    tag_multipliers: Mapped[str] = mapped_column(Text, nullable=False)
+    # pending | running | completed | failed | cancelling | cancelled
+    status: Mapped[str] = mapped_column(String(50), default="pending")
+    # Computed at start: sum over items of `variants_for(item.tags)`. Lets the
+    # UI render a real progress bar instead of an unbounded spinner.
+    total_planned: Mapped[int] = mapped_column(Integer, default=0)
+    completed_count: Mapped[int] = mapped_column(Integer, default=0)
+    failed_count: Mapped[int] = mapped_column(Integer, default=0)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
 # ─── Feedback / RLHF ────────────────────────────────────────────────────────

@@ -4,7 +4,34 @@ import { tokens } from '../../theme/tokens';
 import { Button } from '../common/Button';
 import { Badge } from '../common/Badge';
 import { postTrainingApi } from '../../api/postTraining';
-import type { Dataset } from '../../types';
+import { useEscapeKey } from '../../hooks/useEscapeKey';
+import type { BacktestResult, BacktestRun, Dataset } from '../../types';
+
+// Pass/fail determination from a BacktestResult.
+//
+// The backend writes result.status = 'passed' | 'failed' directly (it doesn't
+// use 'completed' — that's only on parent BacktestRun). We trust that string
+// when present; if it's anything else (pending/error/cancelled), we fall back
+// to a threshold check on pass_score, and only return 'not_evaluated' when
+// there's nothing usable to score at all.
+//
+// Returning 'not_evaluated' rather than guessing keeps surprise tags off the
+// training data — better to leave a case untagged than silently stamp it
+// `bt:failed` because the backtest never actually scored it.
+function deriveOutcome(
+  result: BacktestResult | undefined,
+  threshold: number,
+): 'passed' | 'failed' | 'not_evaluated' {
+  if (!result) return 'not_evaluated';
+  if (result.status === 'passed') return 'passed';
+  if (result.status === 'failed') return 'failed';
+  // Status is something else (pending/error/cancelled) — threshold-compare
+  // if we have a score, otherwise treat as not evaluated.
+  if (typeof result.pass_score === 'number') {
+    return result.pass_score >= threshold ? 'passed' : 'failed';
+  }
+  return 'not_evaluated';
+}
 
 const Overlay = styled.div`
   position: fixed;
@@ -163,6 +190,14 @@ export interface AddToDatasetItem {
   output_text: string;
   /** Optional label shown in preview (e.g., test case name or "Backtest result for X") */
   label?: string;
+  /** Persisted as DatasetItem.name — curation label, not training-visible. */
+  name?: string;
+  /** Provenance back-link to the source TestCase, persisted on DatasetItem. */
+  source_test_case_id?: string;
+  /** Per-item tags that survive into DatasetItem.tags. The modal-level shared
+   * tags input is concatenated AFTER these (so caller-set provenance tags
+   * like `bt:failed,bt_run:abc` won't be silently overwritten). */
+  tags?: string;
 }
 
 interface Props {
@@ -178,6 +213,11 @@ interface Props {
   title?: string;
   /** Optional callback after items are added */
   onAdded?: () => void;
+  /** Pre-select a reference BacktestRun in the outcome-tag dropdown.
+   *  Passed by BacktestPanel when the user opens the modal from inside a
+   *  specific run's context — the dropdown then defaults to that run so
+   *  `bt:passed`/`bt:failed` tags get applied automatically. */
+  defaultBacktestRunId?: string;
 }
 
 export function AddToDatasetModal({
@@ -189,6 +229,7 @@ export function AddToDatasetModal({
   defaultSystemMessage = '',
   title = 'Add to SFT Dataset',
   onAdded,
+  defaultBacktestRunId,
 }: Props) {
   const [datasets, setDatasets] = useState<Dataset[]>([]);
   const [selectedDatasetId, setSelectedDatasetId] = useState<string>('');
@@ -198,6 +239,23 @@ export function AddToDatasetModal({
   const [systemMessage, setSystemMessage] = useState(defaultSystemMessage);
   const [tags, setTags] = useState('');
   const [submitting, setSubmitting] = useState(false);
+
+  // Phase 2: reference-backtest-run picker. When set, each item whose
+  // source_test_case_id appears in the run's results gets tagged
+  // `bt:passed`/`bt:failed` + `bt_run:<short>`. Items without a source TC,
+  // or whose TC isn't in the chosen run, get `bt:not_evaluated`.
+  const [backtestRuns, setBacktestRuns] = useState<BacktestRun[]>([]);
+  const [selectedBacktestRunId, setSelectedBacktestRunId] = useState<string>(
+    defaultBacktestRunId ?? '',
+  );
+  // pass_threshold for the currently selected run (needed to derive pass/fail
+  // from a result's pass_score).
+  const [selectedRunThreshold, setSelectedRunThreshold] = useState<number>(0.5);
+  const [resultByTcId, setResultByTcId] = useState<Map<string, BacktestResult>>(new Map());
+  const [loadingResults, setLoadingResults] = useState(false);
+
+  // Close on Escape unless we're mid-submit (mirrors the Cancel button's disabled state).
+  useEscapeKey(onClose, open && !submitting);
   const [error, setError] = useState<string | null>(null);
 
   // Re-sync defaults whenever the modal is reopened
@@ -207,10 +265,59 @@ export function AddToDatasetModal({
       setSystemMessage(defaultSystemMessage);
       setTags('');
       setError(null);
+      setSelectedBacktestRunId(defaultBacktestRunId ?? '');
       loadDatasets();
+      // Fetch all backtest runs for the project so the dropdown has options.
+      postTrainingApi.listBacktestRuns(projectId)
+        .then((runs) => setBacktestRuns(runs))
+        .catch(() => setBacktestRuns([]));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, defaultInstruction, defaultSystemMessage]);
+  }, [open, defaultInstruction, defaultSystemMessage, defaultBacktestRunId, projectId]);
+
+  // Load results when the user (or the prop default) selects a run.
+  useEffect(() => {
+    if (!open) return;
+    if (!selectedBacktestRunId) {
+      setResultByTcId(new Map());
+      setSelectedRunThreshold(0.5);
+      return;
+    }
+    setLoadingResults(true);
+    postTrainingApi.getBacktestRun(projectId, selectedBacktestRunId)
+      .then((run) => {
+        const m = new Map<string, BacktestResult>();
+        for (const r of run.results) m.set(r.test_case_id, r);
+        setResultByTcId(m);
+        setSelectedRunThreshold(run.pass_threshold ?? 0.5);
+      })
+      .catch(() => {
+        setResultByTcId(new Map());
+      })
+      .finally(() => setLoadingResults(false));
+  }, [open, projectId, selectedBacktestRunId]);
+
+  // Outcome counts shown next to the dropdown so the user knows what's going
+  // to be tagged before they hit Save. Counts only consider items that have
+  // a `source_test_case_id` — items without one can't be tagged at all.
+  // We split "not_evaluated" into two finer buckets so the user can tell
+  // "wrong run picked" (notInRun) apart from "run had this TC but result
+  // was errored/skipped" (unscored) — they're both `bt:not_evaluated` on
+  // the persisted tag but cause different follow-up actions.
+  const outcomeCounts = (() => {
+    if (!selectedBacktestRunId) return null;
+    let passed = 0, failed = 0, notInRun = 0, unscored = 0, untaggable = 0;
+    for (const item of items) {
+      if (!item.source_test_case_id) { untaggable++; continue; }
+      const result = resultByTcId.get(item.source_test_case_id);
+      if (!result) { notInRun++; continue; }
+      const outcome = deriveOutcome(result, selectedRunThreshold);
+      if (outcome === 'passed') passed++;
+      else if (outcome === 'failed') failed++;
+      else unscored++;
+    }
+    return { passed, failed, notInRun, unscored, untaggable };
+  })();
 
   async function loadDatasets() {
     try {
@@ -257,14 +364,47 @@ export function AddToDatasetModal({
         return;
       }
 
-      // Build payload — apply instruction/system_message to all items
-      const payload = items.map((item) => ({
-        input_text: item.input_text,
-        output_text: item.output_text,
-        instruction: instruction.trim() || undefined,
-        system_message: systemMessage.trim() || undefined,
-        tags: tags.trim() || undefined,
-      }));
+      // Build payload — apply instruction/system_message to all items. Tag
+      // composition (most-specific first → most-generic last):
+      //   1. per-item tags (already carry e.g. test-case provenance)
+      //   2. bt:passed / bt:failed / bt:not_evaluated + bt_run:<short>
+      //      (only when a reference backtest run was picked)
+      //   3. modal-level shared tags input
+      //
+      // Items without `source_test_case_id` skip step 2 entirely — there's
+      // nothing meaningful to look up.
+      const sharedTags = tags.trim();
+      const runShortId = selectedBacktestRunId
+        ? selectedBacktestRunId.slice(0, 8)
+        : null;
+
+      const payload = items.map((item) => {
+        const parts: string[] = [];
+        const perItemTags = (item.tags || '').trim();
+        if (perItemTags) parts.push(perItemTags);
+
+        if (selectedBacktestRunId && item.source_test_case_id) {
+          const outcome = deriveOutcome(
+            resultByTcId.get(item.source_test_case_id),
+            selectedRunThreshold,
+          );
+          parts.push(`bt:${outcome}`);
+          if (runShortId) parts.push(`bt_run:${runShortId}`);
+        }
+
+        if (sharedTags) parts.push(sharedTags);
+        const mergedTags = parts.length ? parts.join(',') : undefined;
+
+        return {
+          name: item.name || undefined,
+          input_text: item.input_text,
+          output_text: item.output_text,
+          instruction: instruction.trim() || undefined,
+          system_message: systemMessage.trim() || undefined,
+          tags: mergedTags,
+          source_test_case_id: item.source_test_case_id || undefined,
+        };
+      });
 
       await postTrainingApi.addDatasetItems(projectId, datasetId, payload);
 
@@ -374,6 +514,69 @@ export function AddToDatasetModal({
               placeholder="comma,separated,tags"
             />
           </FormGroup>
+
+          {/* Reference Backtest Run — adds bt:passed/bt:failed tags per item.
+              Only meaningful for items that carry source_test_case_id (i.e.,
+              were exported from TestCases). Hidden entirely when zero items
+              have provenance — no point offering the picker. */}
+          {items.some((it) => !!it.source_test_case_id) && (
+            <FormGroup>
+              <Label>Reference Backtest Run (optional)</Label>
+              <Select
+                value={selectedBacktestRunId}
+                onChange={(e) => setSelectedBacktestRunId(e.target.value)}
+              >
+                <option value="">— none (no outcome tags) —</option>
+                {backtestRuns.map((r) => (
+                  <option key={r.id} value={r.id}>
+                    {r.name} {r.pass_rate != null ? `· ${(r.pass_rate * 100).toFixed(0)}% pass` : ''} · {r.status}
+                  </option>
+                ))}
+              </Select>
+              <HelpText>
+                Tags each item with <code>bt:passed</code> / <code>bt:failed</code> /
+                <code> bt:not_evaluated</code> + <code>bt_run:&lt;id&gt;</code> based on the chosen
+                run's results. Cases not in the chosen run get <code>bt:not_evaluated</code>.
+              </HelpText>
+              {selectedBacktestRunId && (
+                loadingResults ? (
+                  <HelpText>Loading run results…</HelpText>
+                ) : outcomeCounts && (
+                  <div
+                    style={{
+                      display: 'flex',
+                      flexWrap: 'wrap',
+                      gap: 6,
+                      marginTop: 4,
+                      fontSize: '0.78rem',
+                    }}
+                  >
+                    {outcomeCounts.passed > 0 && (
+                      <Badge color="success">{outcomeCounts.passed} passed</Badge>
+                    )}
+                    {outcomeCounts.failed > 0 && (
+                      <Badge color="error">{outcomeCounts.failed} failed</Badge>
+                    )}
+                    {outcomeCounts.notInRun > 0 && (
+                      <Badge color="secondary">
+                        {outcomeCounts.notInRun} not in run
+                      </Badge>
+                    )}
+                    {outcomeCounts.unscored > 0 && (
+                      <Badge color="secondary">
+                        {outcomeCounts.unscored} unscored
+                      </Badge>
+                    )}
+                    {outcomeCounts.untaggable > 0 && (
+                      <Badge color="secondary">
+                        {outcomeCounts.untaggable} no source TC
+                      </Badge>
+                    )}
+                  </div>
+                )
+              )}
+            </FormGroup>
+          )}
 
           {/* Preview of items */}
           <FormGroup>

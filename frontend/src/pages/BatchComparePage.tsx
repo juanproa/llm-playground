@@ -12,6 +12,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useParams } from 'react-router-dom';
 import styled from 'styled-components';
 import { tokens } from '../theme/tokens';
+import { useEscapeKey } from '../hooks/useEscapeKey';
 import { TopBar } from '../components/layout/TopBar';
 import { WorkspaceSubNav } from '../components/workspace/WorkspaceSubNav';
 import { Button } from '../components/common/Button';
@@ -537,6 +538,18 @@ export function BatchComparePage() {
   const [backtestSaveSuccess, setBacktestSaveSuccess] = useState(false);
   const [backtestSaveError, setBacktestSaveError] = useState<string | null>(null);
 
+  // Bulk backtest selection — cellKey format matches the per-cell expanded
+  // state key (`${rowId}:${col.kind}:${col.id}`) so they're interchangeable.
+  const [selectedCellKeys, setSelectedCellKeys] = useState<Set<string>>(new Set());
+  const [bulkBacktestOpen, setBulkBacktestOpen] = useState(false);
+  const [bulkExpectedType, setBulkExpectedType] = useState('classification');
+  const [bulkTags, setBulkTags] = useState('batch_compare');
+  const [bulkNotes, setBulkNotes] = useState('');
+  const [bulkIsGolden, setBulkIsGolden] = useState(false);
+  const [bulkSaving, setBulkSaving] = useState(false);
+  const [bulkProgress, setBulkProgress] = useState<{ done: number; total: number; failed: number } | null>(null);
+  const [bulkDone, setBulkDone] = useState(false);
+
   // Chains available as columns. A chain runs as a single canonical column —
   // the chain's full `final_output` JSON ({node_name: text}) is the cell value.
   // Chains carry their own prompts and per-node models, so prompt overrides /
@@ -574,6 +587,17 @@ export function BatchComparePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectId]);
 
+  // Esc-to-close: each modal registers its own handler; the topmost active one
+  // closes when Escape is pressed (handled by the useEscapeKey hook's stack).
+  useEscapeKey(() => setShowModal(false), showModal);
+  useEscapeKey(() => setAddTarget(null), !!addTarget);
+  useEscapeKey(() => setBacktestTarget(null), !!backtestTarget);
+  useEscapeKey(
+    () => { if (!bulkSaving) closeBulkBacktest(); },
+    bulkBacktestOpen,
+  );
+  useEscapeKey(() => setExpandFullRowData(null), !!expandFullRowData);
+
   // Fetch items when the selected dataset changes; default-select all so the
   // common case ("use the whole dataset") still requires zero clicks.
   useEffect(() => {
@@ -605,6 +629,8 @@ export function BatchComparePage() {
 
   // Poll selected run if it's running
   useEffect(() => {
+    // Clear stale bulk selection — cellKeys reference the previous run's rows.
+    setSelectedCellKeys(new Set());
     if (!selectedId || !projectId) {
       setDetail(null);
       return;
@@ -778,6 +804,42 @@ export function BatchComparePage() {
     setSavingToBacktest(false);
   }
 
+  // ─── Bulk backtest helpers ───────────────────────────────────────────────
+
+  function toggleCellSelected(cellKey: string) {
+    setSelectedCellKeys((prev) => {
+      const next = new Set(prev);
+      if (next.has(cellKey)) next.delete(cellKey);
+      else next.add(cellKey);
+      return next;
+    });
+  }
+
+  function clearCellSelection() {
+    setSelectedCellKeys(new Set());
+  }
+
+  function openBulkBacktest() {
+    setBulkBacktestOpen(true);
+    setBulkDone(false);
+    setBulkProgress(null);
+    setBulkExpectedType('classification');
+    setBulkTags('batch_compare');
+    setBulkNotes('');
+    setBulkIsGolden(false);
+  }
+
+  function closeBulkBacktest() {
+    setBulkBacktestOpen(false);
+    if (bulkDone) {
+      // Clear selection only after a successful (or partial) save so users
+      // can retry without re-checking everything if they cancelled mid-form.
+      setSelectedCellKeys(new Set());
+      setBulkDone(false);
+      setBulkProgress(null);
+    }
+  }
+
   function openExpandFullRow(row: MatrixRow, cols: MatrixCol[]) {
     setExpandFullRowData({ row, cols });
     setFullRowScrollLock(false);
@@ -907,6 +969,98 @@ export function BatchComparePage() {
 
   // Build the matrix data from detail
   const matrix = useMemo(() => buildMatrix(detail), [detail]);
+
+  // Cells eligible for bulk backtest: completed + non-empty output. Mirrors
+  // the gate used to render the per-cell "+ Backtest" button (line ~1283).
+  const selectableCellKeys = useMemo(() => {
+    const keys: string[] = [];
+    for (const row of matrix.rows) {
+      row.cells.forEach((cell, colIdx) => {
+        if (!cell) return;
+        if (cell.result.status !== 'completed') return;
+        if (!cell.result.actual_output) return;
+        const col = matrix.cols[colIdx];
+        keys.push(`${row.inputItem.id}:${col.kind}:${col.id}`);
+      });
+    }
+    return keys;
+  }, [matrix]);
+
+  function selectAllSelectableCells() {
+    setSelectedCellKeys(new Set(selectableCellKeys));
+  }
+
+  // Resolve a cellKey back to (row, col, cell, modelName) — needed for bulk
+  // save and the dialog preview list.
+  function resolveCellKey(cellKey: string): { row: MatrixRow; col: MatrixCol; cell: CellData; modelName: string } | null {
+    const idx = cellKey.indexOf(':');
+    if (idx < 0) return null;
+    const rowId = cellKey.slice(0, idx);
+    const rest = cellKey.slice(idx + 1);
+    const sepIdx = rest.indexOf(':');
+    if (sepIdx < 0) return null;
+    const kind = rest.slice(0, sepIdx);
+    const colId = rest.slice(sepIdx + 1);
+    const row = matrix.rows.find((r) => r.inputItem.id === rowId);
+    if (!row) return null;
+    const colIdx = matrix.cols.findIndex((c) => c.kind === kind && c.id === colId);
+    if (colIdx < 0) return null;
+    const col = matrix.cols[colIdx];
+    const cell = row.cells[colIdx];
+    if (!cell) return null;
+    const modelName = col.kind === 'chain'
+      ? (chains.find((c) => c.id === col.id)?.name ?? col.id.slice(0, 8))
+      : (models.find((x) => x.id === col.id)?.name ?? col.id.slice(0, 8));
+    return { row, col, cell, modelName };
+  }
+
+  async function handleBulkSaveBacktest() {
+    if (!projectId) return;
+    const keys = Array.from(selectedCellKeys);
+    if (keys.length === 0) return;
+    setBulkSaving(true);
+    setBulkProgress({ done: 0, total: keys.length, failed: 0 });
+    let done = 0;
+    let failed = 0;
+    for (const key of keys) {
+      const resolved = resolveCellKey(key);
+      if (!resolved) {
+        failed++;
+        done++;
+        setBulkProgress({ done, total: keys.length, failed });
+        continue;
+      }
+      const { row, col, cell, modelName } = resolved;
+      const cleaned = col.kind === 'chain'
+        ? prettyChainOutput(cell.result.actual_output)
+        : stripThinkTags(cell.result.actual_output);
+      const baseName = row.inputItem.name?.trim();
+      const name = baseName
+        ? `${baseName} – ${modelName}`
+        : `Test case – ${modelName} – ${done + 1}`;
+      const sharedTags = bulkTags.trim();
+      const tags = sharedTags
+        ? `${sharedTags},model:${modelName}`
+        : `model:${modelName}`;
+      try {
+        await postTrainingApi.createTestCase(projectId, {
+          name,
+          input_text: row.inputItem.input_text,
+          expected_output: cleaned,
+          expected_type: bulkExpectedType,
+          tags,
+          notes: bulkNotes.trim() || undefined,
+          is_golden: bulkIsGolden,
+        });
+      } catch {
+        failed++;
+      }
+      done++;
+      setBulkProgress({ done, total: keys.length, failed });
+    }
+    setBulkSaving(false);
+    setBulkDone(true);
+  }
 
   // Lookup helper: a column-level label for the prompt actually used by this child run.
   // Lets the header surface "custom prompt" badges for models running an override.
@@ -1096,6 +1250,36 @@ export function BatchComparePage() {
                     }}
                   /> Scroll lock
                 </label>
+                {selectableCellKeys.length > 0 && (
+                  <>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={selectAllSelectableCells}
+                      title="Check every completed cell with output"
+                    >
+                      Select all cells ({selectableCellKeys.length})
+                    </Button>
+                    {selectedCellKeys.size > 0 && (
+                      <>
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          onClick={clearCellSelection}
+                        >
+                          Clear ({selectedCellKeys.size})
+                        </Button>
+                        <Button
+                          size="sm"
+                          onClick={openBulkBacktest}
+                          title="Save every selected cell as a Backtest test case"
+                        >
+                          + Backtest ({selectedCellKeys.size})
+                        </Button>
+                      </>
+                    )}
+                  </>
+                )}
                 <div style={{ marginLeft: 'auto', color: tokens.colors.text.muted }}>
                   {filteredRows.length} / {matrix.rows.length} rows
                 </div>
@@ -1268,6 +1452,16 @@ export function BatchComparePage() {
                             style={{ cursor: 'pointer' }}
                           >
                             <Row>
+                              {status === 'completed' && cell.result.actual_output && (
+                                <input
+                                  type="checkbox"
+                                  checked={selectedCellKeys.has(cellKey)}
+                                  onChange={() => toggleCellSelected(cellKey)}
+                                  onClick={(e) => e.stopPropagation()}
+                                  title="Select this cell for bulk backtest"
+                                  style={{ margin: 0, cursor: 'pointer' }}
+                                />
+                              )}
                               {isPending ? (
                                 <Badge color="secondary">pending</Badge>
                               ) : isFailed ? (
@@ -1556,6 +1750,146 @@ export function BatchComparePage() {
                     onClick={handleSaveToBacktest}
                   >
                     {savingToBacktest ? 'Saving…' : 'Save Test Case'}
+                  </Button>
+                </>
+              )}
+            </ModalBody>
+          </Dialog>
+        </DialogOverlay>
+      )}
+
+      {/* ── Bulk Add to Backtest dialog ── */}
+      {bulkBacktestOpen && (
+        <DialogOverlay onClick={() => { if (!bulkSaving) closeBulkBacktest(); }}>
+          <Dialog onClick={(e) => e.stopPropagation()}>
+            <ModalHead>
+              <PaneTitle>
+                Save {selectedCellKeys.size} cell{selectedCellKeys.size === 1 ? '' : 's'} as Backtest test cases
+              </PaneTitle>
+              <Button size="sm" variant="ghost" disabled={bulkSaving} onClick={closeBulkBacktest}>Close</Button>
+            </ModalHead>
+            <ModalBody>
+              {bulkDone ? (
+                <div style={{ textAlign: 'center', padding: '16px 0' }}>
+                  <div style={{ color: tokens.colors.accent.success, marginBottom: 8 }}>
+                    ✓ Created {bulkProgress ? bulkProgress.done - bulkProgress.failed : 0} test case{(bulkProgress?.done ?? 1) === 1 ? '' : 's'}
+                    {bulkProgress && bulkProgress.failed > 0 && (
+                      <span style={{ color: tokens.colors.accent.error }}>
+                        {' '}· {bulkProgress.failed} failed
+                      </span>
+                    )}
+                  </div>
+                  <Button size="sm" variant="ghost" onClick={closeBulkBacktest}>Close</Button>
+                </div>
+              ) : (
+                <>
+                  <FormGroup>
+                    <Label>Selected cells ({selectedCellKeys.size})</Label>
+                    <div
+                      style={{
+                        background: tokens.colors.bg.primary,
+                        border: `1px solid ${tokens.colors.border.subtle}`,
+                        borderRadius: tokens.radii.sm,
+                        padding: 8,
+                        maxHeight: 140,
+                        overflowY: 'auto',
+                        fontSize: '0.75rem',
+                        fontFamily: tokens.fonts.mono,
+                        color: tokens.colors.text.secondary,
+                      }}
+                    >
+                      {Array.from(selectedCellKeys).slice(0, 10).map((key) => {
+                        const r = resolveCellKey(key);
+                        if (!r) return <div key={key}>(removed)</div>;
+                        const rowLabel = r.row.inputItem.name || inputPreview(r.row.inputItem.input_text, 40);
+                        return (
+                          <div key={key} style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                            {rowLabel} → {r.modelName}
+                          </div>
+                        );
+                      })}
+                      {selectedCellKeys.size > 10 && (
+                        <div style={{ color: tokens.colors.text.muted, marginTop: 4 }}>
+                          … and {selectedCellKeys.size - 10} more
+                        </div>
+                      )}
+                    </div>
+                    <Muted style={{ marginTop: 4 }}>
+                      Each test case auto-named <code>{'{input}'} – {'{model}'}</code>. Outputs cleaned of <code>{'<think>'}</code> blocks.
+                    </Muted>
+                  </FormGroup>
+
+                  <FormGroup>
+                    <Label>Expected Output Type (applied to all)</Label>
+                    <Select value={bulkExpectedType} onChange={(e) => setBulkExpectedType(e.target.value)}>
+                      <option value="generative">Generative</option>
+                      <option value="classification">Classification</option>
+                      <option value="extraction">Extraction</option>
+                      <option value="structured">Structured</option>
+                    </Select>
+                  </FormGroup>
+
+                  <FormGroup>
+                    <Label>Shared tags (per-case <code>model:{'{name}'}</code> appended)</Label>
+                    <Input
+                      value={bulkTags}
+                      onChange={(e) => setBulkTags(e.target.value)}
+                      placeholder="batch_compare"
+                    />
+                  </FormGroup>
+
+                  <FormGroup>
+                    <Label>Notes (applied to every case, optional)</Label>
+                    <textarea
+                      value={bulkNotes}
+                      onChange={(e) => setBulkNotes(e.target.value)}
+                      placeholder="Shared note for this bulk import"
+                      style={{
+                        width: '100%',
+                        minHeight: 50,
+                        background: tokens.colors.bg.tertiary,
+                        border: `1px solid ${tokens.colors.border.subtle}`,
+                        borderRadius: tokens.radii.sm,
+                        color: tokens.colors.text.primary,
+                        padding: '8px 10px',
+                        fontFamily: tokens.fonts.body,
+                        fontSize: '0.82rem',
+                        outline: 'none',
+                        resize: 'vertical',
+                        boxSizing: 'border-box',
+                      }}
+                    />
+                  </FormGroup>
+
+                  <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '0.82rem', color: tokens.colors.text.secondary, cursor: 'pointer' }}>
+                    <input
+                      type="checkbox"
+                      checked={bulkIsGolden}
+                      onChange={(e) => setBulkIsGolden(e.target.checked)}
+                      style={{ accentColor: tokens.colors.accent.primary }}
+                    />
+                    Mark all as golden dataset entries
+                  </label>
+
+                  {bulkSaving && bulkProgress && (
+                    <Muted style={{ color: tokens.colors.text.primary }}>
+                      Saving {bulkProgress.done}/{bulkProgress.total}
+                      {bulkProgress.failed > 0 && (
+                        <span style={{ color: tokens.colors.accent.error }}>
+                          {' '}· {bulkProgress.failed} failed
+                        </span>
+                      )}
+                      …
+                    </Muted>
+                  )}
+
+                  <Button
+                    disabled={bulkSaving || selectedCellKeys.size === 0}
+                    onClick={handleBulkSaveBacktest}
+                  >
+                    {bulkSaving
+                      ? `Saving ${bulkProgress?.done ?? 0}/${bulkProgress?.total ?? selectedCellKeys.size}…`
+                      : `Save ${selectedCellKeys.size} test case${selectedCellKeys.size === 1 ? '' : 's'}`}
                   </Button>
                 </>
               )}

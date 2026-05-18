@@ -8,6 +8,7 @@ import { useInferenceStore } from '../../stores/inferenceStore';
 import { parseThinking, stripThinkingFromStream } from '../../utils/thinkingFilter';
 import { postTrainingApi } from '../../api/postTraining';
 import { documentsApi } from '../../api/documents';
+import { useEscapeKey } from '../../hooks/useEscapeKey';
 import { PromptBuilderChat } from './PromptBuilderChat';
 import type { InferenceRun, ModelConfig, Prompt } from '../../types';
 
@@ -342,6 +343,10 @@ function RunDetail({
   const [showSaveModal, setShowSaveModal] = useState(false);
 
   const canSave = run.status === 'completed' && !!run.output_text;
+
+  // Esc closes the run-detail drawer only when no nested modal is open.
+  // The nested SaveTestCaseModal registers its own handler (stacked on top).
+  useEscapeKey(onClose, !showSaveModal);
 
   return (
     <DetailOverlay onClick={onClose}>
@@ -717,6 +722,9 @@ function SaveTestCaseModal({ run, projectId, onClose }: SaveTestCaseModalProps) 
   const [saveError, setSaveError] = useState<string | null>(null);
   const [documentContent, setDocumentContent] = useState<string | null>(null);
   const [docLoaded, setDocLoaded] = useState(!run.document_id); // true if no doc to load
+
+  // Esc closes the save dialog (but not while save is in flight).
+  useEscapeKey(onClose, !saving);
 
   // Fetch document content if the run had a document attached
   useEffect(() => {

@@ -5,6 +5,7 @@ import csv
 import io
 import json
 import re
+from datetime import datetime
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
 from fastapi.responses import PlainTextResponse
@@ -12,6 +13,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.dependencies import get_db
+from app.models.model_config import ModelConfig
 from app.models.post_training import (
     BacktestResult,
     BacktestRun,
@@ -24,6 +26,7 @@ from app.models.post_training import (
     FeedbackItem,
     FeedbackRun,
     FusionJob,
+    SyntheticJob,
     TestCase,
     TrainingJob,
 )
@@ -54,6 +57,8 @@ from app.schemas.post_training import (
     FusionJobResponse,
     HfModelInfo,
     MlxModelInfo,
+    SyntheticJobCreate,
+    SyntheticJobResponse,
     TestCaseCreate,
     TestCaseResponse,
     TestCaseUpdate,
@@ -61,7 +66,7 @@ from app.schemas.post_training import (
     TrainingJobCreate,
     TrainingJobResponse,
 )
-from app.services import backtest_service, comparison_service, dataset_cleaner, feedback_service, fusion_service, sft_service, test_case_pii_service
+from app.services import backtest_service, comparison_service, dataset_cleaner, feedback_service, fusion_service, sft_service, synthetic_data_service, test_case_pii_service
 from app.services.mlx_catalog import KNOWN_HF_MODELS, KNOWN_MLX_MODELS
 from app.services.pdf_parser import parse_pdf
 
@@ -550,6 +555,143 @@ async def delete_training_job(
         raise HTTPException(
             status_code=409,
             detail="Cannot delete a running training job. Stop it first.",
+        )
+    await db.delete(job)
+    await db.flush()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SYNTHETIC DATA JOBS (Phase 3)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@router.get(f"{PREFIX}/synthetic-jobs", response_model=list[SyntheticJobResponse])
+async def list_synthetic_jobs(project_id: str, db: AsyncSession = Depends(get_db)):
+    """All synthetic-data jobs for this project, newest first.
+
+    The frontend polls this list every few seconds while any job is in
+    pending/running/cancelling — same pattern as BacktestRun polling.
+    """
+    result = await db.execute(
+        select(SyntheticJob)
+        .where(SyntheticJob.project_id == project_id)
+        .order_by(SyntheticJob.created_at.desc())
+    )
+    return list(result.scalars().all())
+
+
+@router.post(f"{PREFIX}/synthetic-jobs", response_model=SyntheticJobResponse, status_code=201)
+async def create_synthetic_job(
+    project_id: str,
+    data: SyntheticJobCreate,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
+    """Kick off LLM-driven variation generation into a brand-new target dataset.
+
+    Validates that the source has items, the model is enabled, and the
+    multiplier table would produce at least one variant before doing any
+    work. The target dataset is created eagerly (so the SFT panel sees it
+    appear immediately) — items get filled in by the background worker.
+    """
+    # Source dataset must exist and belong to this project.
+    source = await db.get(Dataset, data.source_dataset_id)
+    if not source or source.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Source dataset not found")
+
+    # Model must exist and be enabled.
+    model = await db.get(ModelConfig, data.model_config_id)
+    if not model:
+        raise HTTPException(status_code=404, detail="Model not found")
+    if not model.is_enabled:
+        raise HTTPException(status_code=400, detail="Model is not enabled")
+
+    if not (data.variation_prompt or "").strip():
+        raise HTTPException(status_code=400, detail="variation_prompt is required")
+
+    # Plan the work up front. Lets us fail with a clear "0 variants planned"
+    # rather than kicking off a doomed job. Load minimum needed for planning.
+    src_items_q = await db.execute(
+        select(DatasetItem.tags).where(DatasetItem.dataset_id == source.id)
+    )
+    item_tag_rows = [{"tags": row[0]} for row in src_items_q.all()]
+    if not item_tag_rows:
+        raise HTTPException(status_code=400, detail="Source dataset has no items")
+    total_planned = synthetic_data_service.plan_total_planned(item_tag_rows, data.tag_multipliers)
+    if total_planned == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Tag multipliers would produce 0 variants. Increase counts or _default.",
+        )
+
+    # Create the target dataset eagerly so it shows up in the SFT panel right
+    # away. The worker fills it in as it goes.
+    target = Dataset(
+        project_id=project_id,
+        name=data.name,
+        description=f"Synthetic dataset generated from '{source.name}' on {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}.",
+        format=source.format,
+        item_count=0,
+    )
+    db.add(target)
+    await db.flush()  # populate target.id
+
+    job = SyntheticJob(
+        project_id=project_id,
+        name=data.name,
+        source_dataset_id=source.id,
+        target_dataset_id=target.id,
+        model_config_id=model.id,
+        variation_prompt=data.variation_prompt,
+        tag_multipliers=json.dumps(data.tag_multipliers),
+        status="pending",
+        total_planned=total_planned,
+    )
+    db.add(job)
+    await db.commit()
+    await db.refresh(job)
+
+    background_tasks.add_task(
+        synthetic_data_service.generate_synthetic_for_dataset, job.id
+    )
+    return job
+
+
+@router.get(f"{PREFIX}/synthetic-jobs/{{job_id}}", response_model=SyntheticJobResponse)
+async def get_synthetic_job(project_id: str, job_id: str, db: AsyncSession = Depends(get_db)):
+    job = await db.get(SyntheticJob, job_id)
+    if not job or job.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Synthetic job not found")
+    return job
+
+
+@router.post(f"{PREFIX}/synthetic-jobs/{{job_id}}/cancel", response_model=SyntheticJobResponse)
+async def cancel_synthetic_job(project_id: str, job_id: str, db: AsyncSession = Depends(get_db)):
+    """Cooperative cancel. Worker checks this status between items and bails."""
+    job = await db.get(SyntheticJob, job_id)
+    if not job or job.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Synthetic job not found")
+    if job.status in ("completed", "failed", "cancelled"):
+        # Terminal — nothing to cancel. Return as-is so the UI stays consistent.
+        return job
+    job.status = "cancelling"
+    await db.commit()
+    await db.refresh(job)
+    return job
+
+
+@router.delete(f"{PREFIX}/synthetic-jobs/{{job_id}}", status_code=204)
+async def delete_synthetic_job(project_id: str, job_id: str, db: AsyncSession = Depends(get_db)):
+    """Remove the job row. We intentionally do NOT cascade-delete the target
+    dataset — the user may want to keep partial output even after dismissing
+    the job from the in-flight panel.
+    """
+    job = await db.get(SyntheticJob, job_id)
+    if not job or job.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Synthetic job not found")
+    if job.status in ("running", "pending", "cancelling"):
+        raise HTTPException(
+            status_code=409,
+            detail="Cancel the job first, then delete it.",
         )
     await db.delete(job)
     await db.flush()

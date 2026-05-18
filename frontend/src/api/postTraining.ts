@@ -14,6 +14,7 @@ import type {
   FusionJob,
   HfModelInfo,
   MlxModelInfo,
+  SyntheticJob,
   TestCase,
   TrainingBackendInfo,
   TrainingJob,
@@ -48,11 +49,14 @@ export const postTrainingApi = {
     projectId: string,
     datasetId: string,
     items: Array<{
+      name?: string;
       instruction?: string;
       input_text?: string;
       output_text: string;
       system_message?: string;
       tags?: string;
+      source_test_case_id?: string;
+      parent_item_id?: string;
     }>,
   ) =>
     apiFetch<DatasetItem[]>(`${base(projectId)}/datasets/${datasetId}/items`, {
@@ -73,12 +77,15 @@ export const postTrainingApi = {
     datasetId: string,
     itemId: string,
     patch: Partial<{
+      name: string | null;
       instruction: string | null;
       input_text: string | null;
       output_text: string;
       system_message: string | null;
       tags: string | null;
       metadata_json: string | null;
+      source_test_case_id: string | null;
+      parent_item_id: string | null;
     }>,
   ) =>
     apiFetch<DatasetItem>(
@@ -395,6 +402,38 @@ export const postTrainingApi = {
 
   deleteBacktestRun: (projectId: string, runId: string) =>
     apiFetch<void>(`${base(projectId)}/backtest-runs/${runId}`, { method: 'DELETE' }),
+
+  // ── Synthetic Jobs (Phase 3) ──────────────────────────────────────────────
+  listSyntheticJobs: (projectId: string) =>
+    apiFetch<SyntheticJob[]>(`${base(projectId)}/synthetic-jobs`),
+
+  createSyntheticJob: (
+    projectId: string,
+    data: {
+      name: string;
+      source_dataset_id: string;
+      model_config_id: string;
+      variation_prompt: string;
+      /** Map of tag → variant count. Reserved key `_default` applies to items
+       *  with no matching tag. Max wins when an item carries multiple tags. */
+      tag_multipliers: Record<string, number>;
+    },
+  ) =>
+    apiFetch<SyntheticJob>(`${base(projectId)}/synthetic-jobs`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+
+  getSyntheticJob: (projectId: string, jobId: string) =>
+    apiFetch<SyntheticJob>(`${base(projectId)}/synthetic-jobs/${jobId}`),
+
+  cancelSyntheticJob: (projectId: string, jobId: string) =>
+    apiFetch<SyntheticJob>(`${base(projectId)}/synthetic-jobs/${jobId}/cancel`, {
+      method: 'POST',
+    }),
+
+  deleteSyntheticJob: (projectId: string, jobId: string) =>
+    apiFetch<void>(`${base(projectId)}/synthetic-jobs/${jobId}`, { method: 'DELETE' }),
 
   // ── Comparison Runs ────────────────────────────────────────────────────────
   listComparisonRuns: (projectId: string) =>

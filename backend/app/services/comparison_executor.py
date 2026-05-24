@@ -40,7 +40,11 @@ from app.services.model_config_service import decrypt_api_key
 logger = logging.getLogger(__name__)
 
 MAX_CONCURRENT = 5
-DEFAULT_MAX_TOKENS = 4096
+# "No limit" sentinel: when user sets max_tokens=0 in Model Registry, fall
+# back to this. Sized for reasoning models — 4096 was too tight and capped
+# chain-of-thought outputs mid-stream. Matches backtest_service and the
+# frontend slider max.
+DEFAULT_MAX_TOKENS = 131072
 
 _DB_WRITE_LOCK = asyncio.Lock()
 
@@ -124,6 +128,8 @@ async def _execute_model_child(child_id: str) -> None:
                 "max_tokens": model_config.max_tokens if (model_config.max_tokens or 0) > 0 else DEFAULT_MAX_TOKENS,
                 "extra_params": dict(model_config.extra_params or {}),
                 "adapter_path": model_config.adapter_path,
+                # Registry toggle wins over extra_params JSON. Legacy NULL → True.
+                "enable_thinking": bool(model_config.enable_thinking) if model_config.enable_thinking is not None else True,
                 "api_key_encrypted": model_config.api_key_encrypted,
                 "base_url": model_config.base_url,
             }
@@ -209,6 +215,8 @@ async def _run_single_cell(result_id: str, prompt_snap: dict, model_snap: dict) 
     extra = dict(model_snap["extra_params"] or {})
     if model_snap.get("adapter_path"):
         extra.setdefault("adapter_path", model_snap["adapter_path"])
+    # Registry toggle overrides any JSON-set enable_thinking.
+    extra["enable_thinking"] = model_snap["enable_thinking"]
 
     start = time.monotonic()
     cache_hit = False

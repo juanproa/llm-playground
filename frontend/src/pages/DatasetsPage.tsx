@@ -260,11 +260,14 @@ export function DatasetsPage() {
     if (selectedId) loadSelected(selectedId);
   }, [selectedId, loadSelected]);
 
-  // Poll while any PDF item is still parsing OR evaluation/masking is running
+  // Poll while any PDF item is still parsing OR evaluation/masking is running.
+  // Also keep polling during 'cancelling' so the user sees the transition to
+  // 'idle' once the worker actually stops.
   useEffect(() => {
     if (!selected) return;
     const hasPending = selected.items.some((it) => it.parse_status === 'pending');
-    const isEvaluating = selected.eval_status === 'running';
+    const isEvaluating =
+      selected.eval_status === 'running' || selected.eval_status === 'cancelling';
     const isMasking = selected.mask_status === 'running';
     if (!hasPending && !isEvaluating && !isMasking) return;
     const t = setInterval(() => {
@@ -434,6 +437,37 @@ export function DatasetsPage() {
     }
   }
 
+  async function handleCancelEvaluation() {
+    if (!selected) return;
+    setError(null);
+    try {
+      await inputDatasetsApi.cancelEvaluateQuality(selected.id);
+      if (selectedId) await loadSelected(selectedId);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Cancel failed');
+    }
+  }
+
+  async function handleForceResetEvaluation() {
+    if (!selected) return;
+    if (
+      !confirm(
+        'Force-reset the evaluation status to "idle"?\n\n' +
+        'Use this only if Cancel didn\'t take effect (e.g. the chosen model is unreachable). ' +
+        'Items already classified keep their result; remaining items stay "unchecked".'
+      )
+    ) {
+      return;
+    }
+    setError(null);
+    try {
+      await inputDatasetsApi.resetEvaluateQuality(selected.id);
+      if (selectedId) await loadSelected(selectedId);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Reset failed');
+    }
+  }
+
   async function handlePreloadPiiModel() {
     setPreloadingPii(true);
     try {
@@ -590,7 +624,10 @@ export function DatasetsPage() {
                     </Button>
                   )}
                   {!selected.items.some((it) => it.parse_status === 'pending') && selected.items.some((it) => it.parse_status === 'ready') && (() => {
-                    const isEvalRunning = selected.eval_status === 'running' || evaluating;
+                    const isEvalRunning =
+                      selected.eval_status === 'running' ||
+                      selected.eval_status === 'cancelling' ||
+                      evaluating;
                     const isMaskRunning = selected.mask_status === 'running' || masking;
                     const isAnyRunning = isEvalRunning || isMaskRunning;
                     const total = selected.items.filter((it) => it.parse_status === 'ready').length;
@@ -632,6 +669,31 @@ export function DatasetsPage() {
                             >
                               {isEvalRunning ? `Evaluating (${evalDone}/${total})` : 'Evaluate Quality'}
                             </Button>
+                            {selected.eval_status === 'running' && (
+                              <Button
+                                size="sm"
+                                variant="secondary"
+                                onClick={handleCancelEvaluation}
+                                title="Stop after the current item finishes"
+                              >
+                                Cancel
+                              </Button>
+                            )}
+                            {(selected.eval_status === 'cancelling' ||
+                              selected.eval_status === 'running') && (
+                              <Button
+                                size="sm"
+                                variant="danger"
+                                onClick={handleForceResetEvaluation}
+                                title={
+                                  selected.eval_status === 'cancelling'
+                                    ? 'If Cancel is stuck, force the status back to idle'
+                                    : 'Last resort: force the status back to idle (use only if Cancel doesn\'t work)'
+                                }
+                              >
+                                {selected.eval_status === 'cancelling' ? 'Force Reset' : 'Reset (stuck?)'}
+                              </Button>
+                            )}
                           </>
                         )}
                         {/* PII masking — uses fixed local model, gated on preload */}

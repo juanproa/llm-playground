@@ -49,6 +49,28 @@ def _require_mlx():
         )
 
 
+def _coerce_enable_thinking(v) -> bool | None:
+    """Normalize the user-supplied enable_thinking value to bool | None.
+
+    Accepts True/False, "true"/"false" (case-insensitive), 1/0, or None.
+    Returns None for any unrecognized input so callers fall back to the
+    model's default behavior rather than guessing.
+    """
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, int):
+        return v != 0
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("true", "1", "yes", "on"):
+            return True
+        if s in ("false", "0", "no", "off"):
+            return False
+    return None
+
+
 def _load_cached(model_id: str, adapter_path: str | None):
     """Return (model, tokenizer) for the given combo, loading if not cached."""
     key = (model_id, adapter_path)
@@ -217,27 +239,119 @@ def preload_async(model_id: str, adapter_path: str | None = None) -> dict:
     return get_status(model_id, adapter_path)
 
 
-def _format_prompt(tokenizer, messages: list[dict]) -> str:
+def _format_prompt(
+    tokenizer,
+    messages: list[dict],
+    enable_thinking: bool | None = None,
+) -> str:
     """Format messages using the tokenizer's chat template when available.
 
     Why this matters: each model has its own turn-separator tokens (e.g.
     Gemma uses <start_of_turn>/<end_of_turn>).  If we don't use the tokenizer's
     template, the model never emits its real EOS token and keeps generating
     until it hits max_tokens — which looks like "streaming forever".
+
+    `enable_thinking`: when set, passed as a Jinja template variable to
+    apply_chat_template. Qwen3's template checks `{% if enable_thinking %}`
+    directly, so it must arrive as a top-level kwarg (not nested under
+    chat_template_kwargs — only transformers ≥4.50 unpacks that automatically).
+    Older tokenizers that don't have **kwargs in their signature just ignore
+    extra kwargs. As a belt-and-suspenders fallback for the OFF case, we also
+    append `/no_think` to the last user message — Qwen3 honors that token even
+    when the template variable doesn't take effect.
+
+    Set enable_thinking=None to use the model's default behavior.
     """
+    # Belt-and-suspenders: for OFF, also inject the /no_think token on the
+    # last user turn. Qwen3 recognizes this token natively and switches modes
+    # mid-prompt, so even if the template variable doesn't get picked up by
+    # the user's transformers version, the model still skips thinking.
+    # We DO NOT mutate the caller's list — copy first.
+    effective_messages = messages
+    if enable_thinking is False:
+        effective_messages = [dict(m) for m in messages]
+        # Find the last user message and append the directive.
+        for m in reversed(effective_messages):
+            if m.get("role") == "user":
+                content = m.get("content", "") or ""
+                # Don't double-append if it's already there.
+                if "/no_think" not in content:
+                    m["content"] = f"{content}\n/no_think"
+                break
+
+    def _log_prompt_tail(rendered: str, label: str) -> None:
+        """Log the last 200 chars of the rendered prompt so we can see whether
+        the chat template baked in the empty `<think>\\n\\n</think>` block (the
+        Qwen3.5 signal that enable_thinking=False landed) or the open `<think>`
+        tag (the signal that thinking is on)."""
+        tail = rendered[-200:] if len(rendered) > 200 else rendered
+        # Make whitespace visible in logs
+        tail_visible = tail.replace("\n", "\\n").replace("\r", "\\r")
+        logger.info(
+            "MLX prompt tail [%s] (last 200 chars): %s",
+            label,
+            tail_visible,
+        )
+
     try:
         if getattr(tokenizer, "chat_template", None):
-            return tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
+            base_kwargs = {
+                "tokenize": False,
+                "add_generation_prompt": True,
+            }
+            # Attempt 1: pass `enable_thinking` directly as a top-level kwarg
+            # (the form Qwen3's Jinja template expects in transformers ≥4.45).
+            if enable_thinking is not None:
+                try:
+                    logger.info(
+                        "MLX chat template: enable_thinking=%s (direct kwarg)",
+                        enable_thinking,
+                    )
+                    rendered = tokenizer.apply_chat_template(
+                        effective_messages,
+                        enable_thinking=enable_thinking,
+                        **base_kwargs,
+                    )
+                    _log_prompt_tail(rendered, "direct kwarg")
+                    return rendered
+                except TypeError as e:
+                    # Tokenizer rejected the kwarg — fall through to attempt 2.
+                    logger.info(
+                        "Direct enable_thinking kwarg rejected (%s); trying chat_template_kwargs",
+                        e,
+                    )
+                # Attempt 2: nest it under chat_template_kwargs (the form
+                # transformers ≥4.50 unpacks before template rendering).
+                try:
+                    logger.info(
+                        "MLX chat template: enable_thinking=%s (chat_template_kwargs)",
+                        enable_thinking,
+                    )
+                    rendered = tokenizer.apply_chat_template(
+                        effective_messages,
+                        chat_template_kwargs={"enable_thinking": enable_thinking},
+                        **base_kwargs,
+                    )
+                    _log_prompt_tail(rendered, "chat_template_kwargs")
+                    return rendered
+                except TypeError as e:
+                    # Neither path accepted; fall through to plain template.
+                    # The /no_think injection above is our last line of defense.
+                    logger.warning(
+                        "chat_template_kwargs also rejected (%s); template variable will be undefined — model defaults to thinking ON",
+                        e,
+                    )
+            rendered = tokenizer.apply_chat_template(effective_messages, **base_kwargs)
+            _log_prompt_tail(rendered, "no enable_thinking")
+            return rendered
     except Exception as e:
         logger.warning("apply_chat_template failed (%s); falling back to generic format", e)
 
-    # Generic fallback — unlikely to produce a clean EOS for any specific model
+    # Generic fallback — unlikely to produce a clean EOS for any specific model.
+    # Use effective_messages so the /no_think injection (if any) survives even
+    # in this branch.
     parts: list[str] = []
-    for m in messages:
+    for m in effective_messages:
         role = m.get("role", "user")
         content = m.get("content", "")
         if role == "system":
@@ -263,6 +377,7 @@ class MlxLocalProvider:
         max_tokens: int,
         temperature: float,
         adapter_path: str | None,
+        enable_thinking: bool | None = None,
     ) -> str:
         _require_mlx()
         from mlx_lm import generate  # type: ignore
@@ -271,7 +386,7 @@ class MlxLocalProvider:
         # Serialize all MLX inference — see _MLX_INFERENCE_LOCK docstring.
         with _MLX_INFERENCE_LOCK:
             model, tokenizer = _load_cached(model_id, adapter_path)
-            prompt = _format_prompt(tokenizer, messages)
+            prompt = _format_prompt(tokenizer, messages, enable_thinking=enable_thinking)
             sampler = make_sampler(temp=temperature)
             return generate(
                 model,
@@ -291,8 +406,14 @@ class MlxLocalProvider:
         **kwargs,
     ) -> LLMResponse:
         adapter_path = kwargs.pop("adapter_path", None)
+        # Read enable_thinking from extra_params (flows in via **kwargs). For
+        # Qwen3 this skips the <think> phase at the chat-template level. Accept
+        # either bool or stringy "false"/"true" since JSON-imported configs may
+        # carry strings. Default None = use model's built-in default.
+        enable_thinking = _coerce_enable_thinking(kwargs.pop("enable_thinking", None))
         text = await asyncio.to_thread(
-            self._generate_sync, model_id, messages, max_tokens, temperature, adapter_path
+            self._generate_sync, model_id, messages, max_tokens, temperature,
+            adapter_path, enable_thinking,
         )
         # Rough token estimates — MLX doesn't surface usage stats directly
         total_chars = sum(len(m.get("content", "")) for m in messages)
@@ -313,6 +434,7 @@ class MlxLocalProvider:
     ) -> AsyncIterator[str]:
         """Stream MLX-LM output token-by-token via stream_generate."""
         adapter_path = kwargs.pop("adapter_path", None)
+        enable_thinking = _coerce_enable_thinking(kwargs.pop("enable_thinking", None))
 
         loop = asyncio.get_event_loop()
         queue: asyncio.Queue[str | None] = asyncio.Queue()
@@ -326,7 +448,7 @@ class MlxLocalProvider:
                 # Serialize all MLX inference — see _MLX_INFERENCE_LOCK docstring.
                 with _MLX_INFERENCE_LOCK:
                     model, tokenizer = _load_cached(model_id, adapter_path)
-                    prompt = _format_prompt(tokenizer, messages)
+                    prompt = _format_prompt(tokenizer, messages, enable_thinking=enable_thinking)
                     sampler = make_sampler(temp=temperature)
 
                     for resp in stream_generate(

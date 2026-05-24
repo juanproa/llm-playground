@@ -85,10 +85,18 @@ def extract_by_path(obj: Any, tokens: list[str | int]) -> Any:
 
 
 def _try_parse_json(text: str) -> Any | None:
-    """Parse JSON, including JSON embedded in markdown code fences."""
+    """Parse JSON, including JSON embedded in markdown code fences or thinking tags."""
     if not text:
         return None
     t = text.strip()
+    # Strip <think>/<thinking>/<reasoning> tags (reasoning models emit these)
+    t = re.sub(
+        r"<(think|thinking|reasoning)>[\s\S]*?</\1>",
+        "",
+        t,
+        flags=re.IGNORECASE,
+    )
+    t = t.strip()
     # Strip ```json ... ``` fences
     fence = re.search(r"```(?:json)?\s*\n(.*?)\n```", t, re.DOTALL | re.IGNORECASE)
     if fence:

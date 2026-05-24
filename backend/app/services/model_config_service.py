@@ -51,6 +51,7 @@ async def create_model(db: AsyncSession, data: ModelConfigCreate) -> ModelConfig
         temperature=data.temperature,
         extra_params=data.extra_params,
         adapter_path=data.adapter_path,
+        enable_thinking=data.enable_thinking,
     )
     db.add(model)
     await db.flush()

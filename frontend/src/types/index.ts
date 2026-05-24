@@ -40,6 +40,7 @@ export interface ModelConfig {
   temperature: number;
   extra_params: Record<string, unknown> | null;
   adapter_path: string | null;
+  enable_thinking: boolean;
   is_enabled: boolean;
   has_api_key: boolean;
   created_at: string;

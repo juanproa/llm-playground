@@ -45,6 +45,7 @@ def _run_migrations(conn) -> None:
         ("pt_test_cases", "pii_status", "ALTER TABLE pt_test_cases ADD COLUMN pii_status VARCHAR(20) DEFAULT 'unchecked'"),
         ("pt_test_cases", "pii_masked_content", "ALTER TABLE pt_test_cases ADD COLUMN pii_masked_content TEXT"),
         ("model_configs", "adapter_path", "ALTER TABLE model_configs ADD COLUMN adapter_path VARCHAR(500)"),
+        ("model_configs", "enable_thinking", "ALTER TABLE model_configs ADD COLUMN enable_thinking BOOLEAN DEFAULT 1"),
         ("pt_test_cases", "assertions", "ALTER TABLE pt_test_cases ADD COLUMN assertions TEXT"),
         ("pt_test_cases", "pass_threshold", "ALTER TABLE pt_test_cases ADD COLUMN pass_threshold FLOAT"),
         ("pt_test_cases", "source_kb_item_id", "ALTER TABLE pt_test_cases ADD COLUMN source_kb_item_id VARCHAR(36)"),

@@ -20,6 +20,10 @@ def _to_response(model) -> ModelConfigResponse:
         temperature=model.temperature,
         extra_params=model.extra_params,
         adapter_path=model.adapter_path,
+        # Legacy rows pre-migration may have NULL even though the column has
+        # a default of 1; coerce to True so the UI toggle never lands in an
+        # undefined state.
+        enable_thinking=bool(getattr(model, "enable_thinking", True) if getattr(model, "enable_thinking", None) is not None else True),
         is_enabled=model.is_enabled,
         has_api_key=model.api_key_encrypted is not None,
         created_at=model.created_at,
@@ -123,11 +127,14 @@ async def test_model(model_id: str, db: AsyncSession = Depends(get_db)):
     provider = get_provider(model.provider, api_key=api_key, base_url=model.base_url)
 
     try:
+        # Pass enable_thinking from model config so the test respects the setting
+        enable_thinking = bool(model.enable_thinking) if model.enable_thinking is not None else True
         response = await provider.generate(
             messages=[{"role": "user", "content": "Say 'hello' in one word."}],
             model_id=model.model_id,
             max_tokens=10,
             temperature=0,
+            enable_thinking=enable_thinking,
         )
         return {"status": "ok", "response": response.content}
     except Exception as e:

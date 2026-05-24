@@ -27,7 +27,13 @@ from app.services.model_config_service import decrypt_api_key
 logger = logging.getLogger(__name__)
 
 MAX_CONCURRENT = 1
-DEFAULT_MAX_TOKENS = 4096
+# "No limit" sentinel: when the user sets max_tokens=0 in Model Registry, we
+# fall back to this value. Sized for reasoning models — the previous 4096
+# (and even 32k) was too tight and caused models like Gemini 2.5 / Qwen3 to
+# exhaust the budget on chain-of-thought before producing the visible answer.
+# Matches the frontend slider max so "No limit" truly means "as high as the
+# UI allows you to set explicitly."
+DEFAULT_MAX_TOKENS = 131072
 
 
 async def _stream_to_response(provider, **kwargs) -> LLMResponse:
@@ -72,14 +78,12 @@ def _strip_think(text: str | None) -> str:
     return _final_cleanup(text)
 
 
-def _find_last_top_level_json(text: str) -> str | None:
-    """Scan `text` for top-level balanced `{…}` blocks and return the LAST
-    one that parses as valid JSON. Handles strings/escapes correctly so braces
-    inside string literals don't confuse the depth counter.
-
-    Returns None if no valid JSON object is found.
+def _find_all_json_objects(text: str) -> list[str]:
+    """Find all top-level balanced `{…}` blocks that parse as valid JSON.
+    Handles strings/escapes correctly so braces inside string literals don't
+    confuse the depth counter. Returns them in order found (last is final answer).
     """
-    last_valid: str | None = None
+    results: list[str] = []
     i = 0
     n = len(text)
     while i < n:
@@ -117,25 +121,34 @@ def _find_last_top_level_json(text: str) -> str | None:
         candidate = text[i:end + 1]
         try:
             json.loads(candidate)
-            last_valid = candidate
+            results.append(candidate)
         except (json.JSONDecodeError, ValueError):
             pass
         i = end + 1
-    return last_valid
+    return results
+
+
+def _find_last_top_level_json(text: str) -> str | None:
+    """Scan `text` for top-level balanced `{…}` blocks and return the LAST
+    one that parses as valid JSON. Handles strings/escapes correctly so braces
+    inside string literals don't confuse the depth counter.
+
+    Returns None if no valid JSON object is found.
+    """
+    all_json = _find_all_json_objects(text)
+    return all_json[-1] if all_json else None
 
 
 def _extract_clean_output(text: str | None, expected: str | None = None) -> str:
     """Aggressive cleanup for backtest comparison.
 
-    Beyond `_strip_think` (which only removes canonical reasoning tags), this
-    also strips:
-      • Markdown ```json fences around the answer.
-      • Untagged reasoning prose preceding a final JSON object — common when
-        a reasoning model is served without `--reasoning-parser` and emits
-        chain-of-thought as plain text rather than wrapping it in <think>.
+    When the test's `expected` is JSON, this returns ONLY the final JSON object
+    found in the model's output — or a clear marker if no JSON was produced.
+    This prevents reasoning prose (with or without <think> tags) from leaking
+    into the actual_output and breaking assertions.
 
-    Triggered only when the test's `expected` looks like JSON; otherwise we
-    leave the cleaned text alone so non-JSON tests aren't accidentally mangled.
+    When `expected` is not JSON, returns the canonical cleaned text (think tags
+    removed) so non-JSON tests aren't accidentally mangled.
     """
     if not text:
         return ""
@@ -150,8 +163,10 @@ def _extract_clean_output(text: str | None, expected: str | None = None) -> str:
     if not expected_is_json:
         return cleaned
 
-    # Strip markdown code fences if the model wrapped the answer in ```json…```.
-    body = re.sub(r"```(?:json|JSON)?\s*", "", cleaned)
+    # Strict JSON mode: walk the ORIGINAL response (not just `cleaned`) so we
+    # catch JSON even inside untagged reasoning prose. Strip markdown fences
+    # first so ```json … ``` wrappers don't block the brace scanner.
+    body = re.sub(r"```(?:json|JSON)?\s*", "", text)
     body = re.sub(r"\s*```\s*", "", body).strip()
 
     # Already pure JSON?
@@ -169,7 +184,11 @@ def _extract_clean_output(text: str | None, expected: str | None = None) -> str:
     if extracted is not None:
         return extracted
 
-    return cleaned
+    # Strict mode: expected is JSON but the model produced none. Return a clear
+    # marker rather than dumping the full reasoning prose into actual_output.
+    # This usually means the model ran out of max_tokens during chain-of-thought
+    # before reaching the final JSON answer — surface that explicitly.
+    return "[NO JSON OUTPUT: model produced only reasoning text. Likely ran out of max_tokens during thinking — increase max_tokens or disable reasoning.]"
 
 # Serializes all DB writes coming out of concurrent run_single coroutines.
 # aiosqlite's threading model + SQLAlchemy async sessions don't always honor
@@ -407,6 +426,7 @@ async def _execute_backtest(db: AsyncSession, backtest_run_id: str) -> None:
         return
 
     # If the run was cancelled before it ever started, finalize and bail.
+    # (Paused runs will re-enter here on resume and are treated as normal start.)
     if run.status in ("cancelling", "cancelled"):
         run.status = "cancelled"
         run.completed_at = datetime.now(timezone.utc)
@@ -431,9 +451,13 @@ async def _execute_backtest(db: AsyncSession, backtest_run_id: str) -> None:
             await db.commit()
             return
 
-        # Load test case result stubs (already created by router)
+        # Load test case result stubs (already created by router).
+        # Filter to only pending results so resumed runs skip already-completed cases.
         result_rows = await db.execute(
-            select(BacktestResult).where(BacktestResult.backtest_run_id == backtest_run_id)
+            select(BacktestResult).where(
+                BacktestResult.backtest_run_id == backtest_run_id,
+                BacktestResult.status == "pending",
+            )
         )
         result_list = list(result_rows.scalars().all())
 
@@ -476,13 +500,16 @@ async def _execute_backtest(db: AsyncSession, backtest_run_id: str) -> None:
             "provider": model_config.provider,
             "model_id": model_config.model_id,
             "temperature": model_config.temperature,
-            # Honor the model's configured cap. Treat 0 as "not set" → fall back
-            # to DEFAULT_MAX_TOKENS so legacy configs don't break, but anything
-            # >0 wins. The previous hardcoded 4096 made local models like
-            # Qwen 8B (4-bit) ramble for minutes per case.
+            # Honor the model's configured cap. Treat 0 as "No limit" (per the
+            # Model Registry toggle) → fall back to DEFAULT_MAX_TOKENS so
+            # reasoning models have enough room for chain-of-thought + answer.
             "max_tokens": model_config.max_tokens if (model_config.max_tokens or 0) > 0 else DEFAULT_MAX_TOKENS,
             "extra_params": dict(model_config.extra_params or {}),
             "adapter_path": model_config.adapter_path,
+            # Column wins over any extra_params["enable_thinking"] the user
+            # may have hand-set in JSON — the toggle is the single source of
+            # truth. Legacy rows (NULL after migration) default to True.
+            "enable_thinking": bool(model_config.enable_thinking) if model_config.enable_thinking is not None else True,
             "api_key_encrypted": model_config.api_key_encrypted,
             "base_url": model_config.base_url,
         }
@@ -563,6 +590,28 @@ async def _execute_backtest(db: AsyncSession, backtest_run_id: str) -> None:
                     row.cache_hit = outcome["cache_hit"]
                     if outcome.get("error_message"):
                         row.error_message = outcome["error_message"]
+
+                    # Incremental aggregation: update the parent BacktestRun's
+                    # counters NOW (not just at the end) so the UI polling sees
+                    # live progress — pass_rate, passed/failed counts tick up as
+                    # each case lands. Done in the same transaction as the
+                    # result write so polling never sees an inconsistent snapshot.
+                    agg_q = await write_db.execute(
+                        select(BacktestResult.status).where(
+                            BacktestResult.backtest_run_id == backtest_run_id
+                        )
+                    )
+                    statuses = [s for (s,) in agg_q.all()]
+                    passed_now = sum(1 for s in statuses if s == "passed")
+                    failed_now = sum(1 for s in statuses if s in ("failed", "error"))
+                    scored_now = passed_now + failed_now
+
+                    run_row = await write_db.get(BacktestRun, backtest_run_id)
+                    if run_row is not None:
+                        run_row.passed_cases = passed_now
+                        run_row.failed_cases = failed_now
+                        run_row.pass_rate = (passed_now / scored_now) if scored_now > 0 else None
+
                     await write_db.commit()
             return outcome
 
@@ -590,10 +639,18 @@ async def _execute_backtest(db: AsyncSession, backtest_run_id: str) -> None:
         run.failed_cases = failed
         run.total_cases = total
         run.pass_rate = (passed / scored) if scored > 0 else None
-        # Honor cancellation: if Stop was hit mid-run, finalize as 'cancelled'
-        # rather than 'completed'. Partial outputs are preserved.
-        run.status = "cancelled" if run.status in ("cancelling", "cancelled") else "completed"
-        run.completed_at = datetime.now(timezone.utc)
+        # Honor pause/cancellation:
+        # - "paused" → user clicked stop, keep as "paused" (ready to resume), don't set completed_at
+        # - "cancelling" → intermediate state, finalize as "cancelled"
+        # - else → mark as "completed"
+        if run.status == "paused":
+            pass  # Keep paused, don't set completed_at (run may resume)
+        elif run.status in ("cancelling", "cancelled"):
+            run.status = "cancelled"
+            run.completed_at = datetime.now(timezone.utc)
+        else:
+            run.status = "completed"
+            run.completed_at = datetime.now(timezone.utc)
         await db.commit()
         no_judge = total - scored
         logger.info(
@@ -691,6 +748,9 @@ async def _run_single_case(
     extra_params = dict(model_snap["extra_params"] or {})
     if model_snap.get("adapter_path"):
         extra_params.setdefault("adapter_path", model_snap["adapter_path"])
+    # Column overrides any user-set enable_thinking in extra_params JSON —
+    # the Registry toggle is the single source of truth.
+    extra_params["enable_thinking"] = model_snap["enable_thinking"]
 
     start = time.monotonic()
     cache_hit = False  # always False now — kept for column compat

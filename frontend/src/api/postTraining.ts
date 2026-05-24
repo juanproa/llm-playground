@@ -403,6 +403,12 @@ export const postTrainingApi = {
   deleteBacktestRun: (projectId: string, runId: string) =>
     apiFetch<void>(`${base(projectId)}/backtest-runs/${runId}`, { method: 'DELETE' }),
 
+  stopBacktestRun: (projectId: string, runId: string) =>
+    apiFetch<BacktestRun>(`${base(projectId)}/backtest-runs/${runId}/stop`, { method: 'POST' }),
+
+  resumeBacktestRun: (projectId: string, runId: string) =>
+    apiFetch<BacktestRun>(`${base(projectId)}/backtest-runs/${runId}/resume`, { method: 'POST' }),
+
   // ── Synthetic Jobs (Phase 3) ──────────────────────────────────────────────
   listSyntheticJobs: (projectId: string) =>
     apiFetch<SyntheticJob[]>(`${base(projectId)}/synthetic-jobs`),
@@ -476,4 +482,153 @@ export const postTrainingApi = {
     apiFetch<ComparisonRun>(`${base(projectId)}/comparison-runs/${comparisonId}/cancel`, {
       method: 'POST',
     }),
+
+  // ── Dataset Studio ────────────────────────────────────────────────────────
+  // Curation tools for SFT datasets (pt_datasets). All operations are
+  // non-destructive — they always create a NEW dataset rather than mutating.
+
+  listCleanupRules: (projectId: string) =>
+    apiFetch<CleanupRule[]>(`${base(projectId)}/dataset-studio/cleanup-rules`),
+
+  previewCleanup: (
+    projectId: string,
+    data: {
+      source_dataset_id: string;
+      enabled_rule_ids: string[];
+      custom_rules: CustomRuleSpec[];
+      sample_size?: number;
+    },
+  ) =>
+    apiFetch<CleanupPreview>(`${base(projectId)}/dataset-studio/preview-cleanup`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+
+  applyCleanup: (
+    projectId: string,
+    data: {
+      source_dataset_id: string;
+      enabled_rule_ids: string[];
+      custom_rules: CustomRuleSpec[];
+      new_name: string;
+      new_description?: string;
+    },
+  ) =>
+    apiFetch<ApplyCleanupResult>(`${base(projectId)}/dataset-studio/apply-cleanup`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+
+  mergeDatasets: (
+    projectId: string,
+    data: {
+      source_dataset_ids: string[];
+      new_name: string;
+      new_description?: string;
+      dedup_strategy: 'none' | 'exact' | 'input_only';
+    },
+  ) =>
+    apiFetch<Dataset>(`${base(projectId)}/dataset-studio/merge`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+
+  tokenStats: (
+    projectId: string,
+    data: { dataset_id: string; model_id: string },
+  ) =>
+    apiFetch<TokenStats>(`${base(projectId)}/dataset-studio/token-stats`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+
+  filterByTokens: (
+    projectId: string,
+    data: {
+      source_dataset_id: string;
+      model_id: string;
+      max_tokens: number;
+      new_name: string;
+      new_description?: string;
+    },
+  ) =>
+    apiFetch<FilterByTokensResult>(`${base(projectId)}/dataset-studio/filter-by-tokens`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
 };
+
+// ─── Dataset Studio types ────────────────────────────────────────────────────
+
+export interface CleanupRule {
+  id: string;
+  name: string;
+  description: string;
+  tier: number;
+  default_on: boolean;
+  type: 'regex' | 'function';
+  pattern: string | null;
+}
+
+export interface CustomRuleSpec {
+  pattern: string;
+  replacement: string;
+  name: string;
+  multiline: boolean;
+}
+
+export interface CleanupSample {
+  id: string;
+  name: string | null;
+  before: string;
+  after: string;
+  chars_before: number;
+  chars_after: number;
+}
+
+export interface CleanupPreview {
+  samples: CleanupSample[];
+  total_chars_before: number;
+  total_chars_after: number;
+  total_items: number;
+  estimated_savings_pct: number;
+}
+
+export interface ApplyCleanupResult {
+  dataset: Dataset;
+  items: number;
+  input_chars_before: number;
+  input_chars_after: number;
+}
+
+export interface TokenStatsItemEntry {
+  id: string;
+  name: string | null;
+  token_count: number;
+}
+
+export interface TokenStats {
+  total_items: number;
+  tokenizer_loaded: boolean;
+  model_id: string;
+  stats: {
+    min?: number;
+    max?: number;
+    mean?: number;
+    p50?: number;
+    p75?: number;
+    p90?: number;
+    p95?: number;
+    p99?: number;
+  };
+  items: TokenStatsItemEntry[];
+  histogram: { bin_edges: number[]; counts: number[] };
+  error?: string | null;
+}
+
+export interface FilterByTokensResult {
+  dataset: Dataset;
+  kept: number;
+  dropped: number;
+  total: number;
+}

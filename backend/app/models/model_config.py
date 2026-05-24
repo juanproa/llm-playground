@@ -25,6 +25,13 @@ class ModelConfig(Base):
     # alongside the base model for inference. Currently honored by the MLX-aware
     # Ollama path and a dedicated MLX local provider.
     adapter_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # Per-model toggle for reasoning/thinking mode. Default True = use the
+    # model's built-in default (Qwen3, Gemini 2.5, Claude w/extended thinking
+    # all default to thinking on when configured for it). When False, the MLX
+    # provider sets chat_template_kwargs={"enable_thinking": False} so the
+    # model never enters thinking mode — no <think> tags, no wasted output
+    # tokens. Providers that don't recognize the kwarg ignore it.
+    enable_thinking: Mapped[bool] = mapped_column(Boolean, default=True)
     is_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at: Mapped[datetime] = mapped_column(

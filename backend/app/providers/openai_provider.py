@@ -54,12 +54,36 @@ class OpenAIProvider:
         temperature: float = 0.7,
         **kwargs,
     ) -> LLMResponse:
-        response = await self.client.chat.completions.create(
-            model=model_id,
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
+        # Extract enable_thinking before passing to API
+        enable_thinking = kwargs.pop("enable_thinking", True)
+
+        # Build API call parameters
+        api_params = {
+            "model": model_id,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+
+        # For vLLM-compatible endpoints, disable reasoning if requested.
+        # vLLM uses chat_template_kwargs to control reasoning mode
+        extra_body = {}
+        if not enable_thinking:
+            extra_body["chat_template_kwargs"] = {"enable_thinking": False}
+            logger.debug("enable_thinking=False: sending chat_template_kwargs with enable_thinking=False")
+
+        # Pass remaining kwargs (like adapter_path for MLX) through extra_body
+        # but exclude any that shouldn't go to the API
+        for key in ["adapter_path"]:
+            if key in kwargs:
+                kwargs.pop(key)
+
+        # Add any remaining kwargs to the API call
+        api_params.update(kwargs)
+        if extra_body:
+            api_params["extra_body"] = extra_body
+
+        response = await self.client.chat.completions.create(**api_params)
         choice = response.choices[0]
         return LLMResponse(
             content=choice.message.content or "",
@@ -76,13 +100,37 @@ class OpenAIProvider:
         temperature: float = 0.7,
         **kwargs,
     ) -> AsyncIterator[str]:
-        stream = await self.client.chat.completions.create(
-            model=model_id,
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            stream=True,
-        )
+        # Extract enable_thinking before passing to API
+        enable_thinking = kwargs.pop("enable_thinking", True)
+
+        # Build API call parameters
+        api_params = {
+            "model": model_id,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "stream": True,
+        }
+
+        # For vLLM-compatible endpoints, disable reasoning if requested.
+        # vLLM uses chat_template_kwargs to control reasoning mode
+        extra_body = {}
+        if not enable_thinking:
+            extra_body["chat_template_kwargs"] = {"enable_thinking": False}
+            logger.debug("enable_thinking=False: sending chat_template_kwargs with enable_thinking=False")
+
+        # Pass remaining kwargs (like adapter_path for MLX) through extra_body
+        # but exclude any that shouldn't go to the API
+        for key in ["adapter_path"]:
+            if key in kwargs:
+                kwargs.pop(key)
+
+        # Add any remaining kwargs to the API call
+        api_params.update(kwargs)
+        if extra_body:
+            api_params["extra_body"] = extra_body
+
+        stream = await self.client.chat.completions.create(**api_params)
         # When the upstream is vLLM with --reasoning-parser, reasoning tokens
         # arrive as `delta.reasoning_content` instead of `delta.content`. If
         # we ignore them, the stream goes silent during the (long) thinking

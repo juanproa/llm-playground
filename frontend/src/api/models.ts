@@ -12,6 +12,7 @@ interface ModelConfigCreate {
   temperature?: number;
   extra_params?: Record<string, unknown>;
   adapter_path?: string;
+  enable_thinking?: boolean;
 }
 
 export interface MlxStatus {

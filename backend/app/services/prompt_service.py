@@ -56,13 +56,80 @@ async def update_prompt(db: AsyncSession, prompt_id: str, data: PromptUpdate) ->
     return prompt
 
 
+class PromptDeleteError(Exception):
+    """Raised when a prompt can't be deleted because some of its versions are
+    pinned by curated artifacts (backtests, comparisons, feedback runs, chain
+    nodes). The user must delete those references first.
+    """
+
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
+
+
 async def delete_prompt(db: AsyncSession, prompt_id: str) -> bool:
     prompt = await db.get(Prompt, prompt_id)
     if not prompt:
         return False
+
+    # Collect all version IDs under this prompt so we can both (a) check
+    # blockers across the whole set and (b) clean InferenceRun rows that
+    # point at them.
+    rows = await db.execute(
+        select(PromptVersion.id).where(PromptVersion.prompt_id == prompt_id)
+    )
+    version_ids = [r[0] for r in rows.all()]
+
+    if version_ids:
+        # Block deletion when ANY version is wired into user-curated artifacts.
+        # Silently dropping a backtest run or chain node by cascading would
+        # erase real user work, so we surface the conflict instead. Inference
+        # history is different — passive workspace log, safe to cascade.
+        blockers = await _count_curated_refs_for_versions(db, version_ids)
+        if blockers:
+            joined = ", ".join(f"{n} {kind}" for kind, n in blockers.items())
+            raise PromptDeleteError(
+                f"Cannot delete: this prompt has versions used by {joined}. Delete those first."
+            )
+
+        # Clean up passive inference history before the cascade hits the
+        # versions — InferenceRun has no ondelete cascade in the schema.
+        await db.execute(
+            sa_delete(InferenceRun).where(InferenceRun.prompt_version_id.in_(version_ids))
+        )
+
     await db.delete(prompt)
     await db.flush()
     return True
+
+
+async def _count_curated_refs_for_versions(
+    db: AsyncSession, version_ids: list[str]
+) -> dict[str, int]:
+    """Count curated rows that pin ANY of these prompt versions.
+
+    Returns a {label: count} dict, empty when safe to delete. Same blocker set
+    as _count_curated_refs but scoped to a list of version ids — used when
+    deleting a whole prompt.
+    """
+    from app.models.chain import ChainNode
+    from app.models.post_training import BacktestRun, ComparisonRun, FeedbackRun
+
+    blockers: dict[str, int] = {}
+    for kind, model, col in (
+        ("backtest run(s)", BacktestRun, BacktestRun.prompt_version_id),
+        ("comparison run(s)", ComparisonRun, ComparisonRun.prompt_version_id),
+        ("feedback run(s)", FeedbackRun, FeedbackRun.prompt_version_id),
+        ("chain node(s)", ChainNode, ChainNode.prompt_version_id),
+    ):
+        n = (
+            await db.execute(
+                select(func.count()).select_from(model).where(col.in_(version_ids))
+            )
+        ).scalar() or 0
+        if n:
+            blockers[kind] = n
+    return blockers
 
 
 async def create_version(db: AsyncSession, prompt_id: str, data: PromptVersionCreate) -> PromptVersion:

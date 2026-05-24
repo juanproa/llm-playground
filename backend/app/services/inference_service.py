@@ -297,6 +297,12 @@ async def run_inference(db: AsyncSession, project_id: str, request: InferenceReq
     extra_params = dict(model_config.extra_params or {})
     if model_config.adapter_path:
         extra_params.setdefault("adapter_path", model_config.adapter_path)
+    # Registry toggle overrides JSON-set enable_thinking. Legacy NULL → True.
+    extra_params["enable_thinking"] = (
+        bool(model_config.enable_thinking)
+        if getattr(model_config, "enable_thinking", None) is not None
+        else True
+    )
     try:
         response = await provider.generate(
             messages=messages,
@@ -372,6 +378,12 @@ async def create_stream_run(
     stream_extra = dict(model_config.extra_params or {})
     if model_config.adapter_path:
         stream_extra.setdefault("adapter_path", model_config.adapter_path)
+    # Registry toggle overrides JSON-set enable_thinking. Legacy NULL → True.
+    stream_extra["enable_thinking"] = (
+        bool(model_config.enable_thinking)
+        if getattr(model_config, "enable_thinking", None) is not None
+        else True
+    )
 
     async def generate_chunks() -> AsyncIterator[str]:
         cleaner = StreamCleaner()

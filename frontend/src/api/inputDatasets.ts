@@ -123,6 +123,20 @@ export const inputDatasetsApi = {
       { method: 'POST' },
     ),
 
+  /** Cooperative cancel — worker stops after the current item finishes. */
+  cancelEvaluateQuality: (datasetId: string) =>
+    apiFetch<{ status: string; message: string }>(
+      `/input-datasets/${datasetId}/evaluate-quality/cancel`,
+      { method: 'POST' },
+    ),
+
+  /** Force-reset eval_status to "idle" — escape hatch for stuck workers. */
+  resetEvaluateQuality: (datasetId: string) =>
+    apiFetch<{ status: string; previous_status: string; message: string }>(
+      `/input-datasets/${datasetId}/evaluate-quality/reset`,
+      { method: 'POST' },
+    ),
+
   getPiiModelStatus: () =>
     apiFetch<PiiModelStatus>(`/input-datasets/pii-filter-status`),
 

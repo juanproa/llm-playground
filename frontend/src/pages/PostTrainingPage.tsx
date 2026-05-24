@@ -6,10 +6,11 @@ import { TopBar } from '../components/layout/TopBar';
 import { SFTPanel } from '../components/post_training/SFTPanel';
 import { FeedbackPanel } from '../components/post_training/FeedbackPanel';
 import { BacktestPanel } from '../components/post_training/BacktestPanel';
+import { DatasetStudioPanel } from '../components/post_training/DatasetStudioPanel';
 import { WorkspaceSubNav } from '../components/workspace/WorkspaceSubNav';
 import { useProjectStore } from '../stores/projectStore';
 
-type Tab = 'sft' | 'feedback' | 'backtest';
+type Tab = 'sft' | 'dataset_studio' | 'feedback' | 'backtest';
 
 const PageWrapper = styled.div`
   display: flex;
@@ -84,6 +85,7 @@ const BackButton = styled.button`
 
 const TABS: Array<{ id: Tab; label: string }> = [
   { id: 'sft', label: 'Fine-Tuning (SFT)' },
+  { id: 'dataset_studio', label: 'Dataset Studio' },
   { id: 'feedback', label: 'Reinforcement Learning' },
   { id: 'backtest', label: 'Backtesting' },
 ];
@@ -133,6 +135,7 @@ export function PostTrainingPage() {
       </TabBar>
       <TabContent>
         {activeTab === 'sft' && <SFTPanel projectId={projectId} />}
+        {activeTab === 'dataset_studio' && <DatasetStudioPanel projectId={projectId} />}
         {activeTab === 'feedback' && <FeedbackPanel projectId={projectId} />}
         {activeTab === 'backtest' && <BacktestPanel projectId={projectId} />}
       </TabContent>

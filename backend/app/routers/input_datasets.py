@@ -353,6 +353,66 @@ async def evaluate_quality(
     return {"queued_count": ready_count, "message": f"Quality evaluation queued for {ready_count} items"}
 
 
+@router.post("/{dataset_id}/evaluate-quality/cancel", response_model=dict)
+async def cancel_evaluate_quality(
+    dataset_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Request cooperative cancel of an in-flight quality evaluation.
+
+    Sets ``eval_status`` to ``"cancelling"``. The background worker checks
+    this flag between items and exits early — items already classified keep
+    their result, remaining items stay ``"unchecked"``. The worker's finally
+    block then restores ``eval_status`` to ``"idle"``.
+
+    For the case where the worker is genuinely dead (process restart, asyncio
+    deadlock with no event-loop progress), use ``/evaluate-quality/reset``
+    instead — that bypasses the cooperative path.
+    """
+    ds = await db.get(InputDataset, dataset_id)
+    if not ds:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+
+    if ds.eval_status == "idle":
+        raise HTTPException(status_code=409, detail="No evaluation in progress")
+    if ds.eval_status == "cancelling":
+        return {"status": "cancelling", "message": "Cancel already requested"}
+
+    ds.eval_status = "cancelling"
+    await db.commit()
+    return {
+        "status": "cancelling",
+        "message": "Cancel requested. The worker will stop after the current item.",
+    }
+
+
+@router.post("/{dataset_id}/evaluate-quality/reset", response_model=dict)
+async def reset_evaluate_quality(
+    dataset_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Force-reset a stuck evaluation.
+
+    Use this when the cooperative cancel doesn't take effect — typically when
+    the worker is hung mid LLM call and the per-item timeout hasn't fired
+    yet, or when the worker process died without cleaning up. Sets
+    ``eval_status`` straight back to ``"idle"`` so the user can start a new
+    evaluation. Items that were already classified keep their result.
+    """
+    ds = await db.get(InputDataset, dataset_id)
+    if not ds:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+
+    previous = ds.eval_status
+    ds.eval_status = "idle"
+    await db.commit()
+    return {
+        "status": "idle",
+        "previous_status": previous,
+        "message": f"Reset eval_status from {previous!r} to 'idle'",
+    }
+
+
 @router.post("/{dataset_id}/mask-pii", response_model=dict, status_code=202)
 async def mask_pii(
     dataset_id: str,

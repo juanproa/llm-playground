@@ -531,11 +531,12 @@ function getStatusColor(status: string): 'success' | 'error' | 'secondary' | 'wa
   }
 }
 
-function getRunBadgeColor(status: string): 'primary' | 'success' | 'error' | 'secondary' {
+function getRunBadgeColor(status: string): 'primary' | 'success' | 'error' | 'secondary' | 'warning' {
   switch (status) {
     case 'running': return 'primary';
     case 'completed': return 'success';
     case 'failed': return 'error';
+    case 'paused': return 'warning';
     default: return 'secondary';
   }
 }
@@ -628,7 +629,7 @@ export function BacktestPanel({ projectId }: Props) {
   // interval is recreated only when the in-progress state actually flips.
 
   const anyRunInProgress = backtestRuns.some(
-    (r) => r.status === 'running' || r.status === 'pending',
+    (r) => r.status === 'running' || r.status === 'pending' || r.status === 'paused',
   );
 
   useEffect(() => {
@@ -647,7 +648,7 @@ export function BacktestPanel({ projectId }: Props) {
   const selectedRunId = selectedRun?.id ?? null;
   const selectedRunInProgress =
     !!selectedRun &&
-    (selectedRun.status === 'running' || selectedRun.status === 'pending');
+    (selectedRun.status === 'running' || selectedRun.status === 'pending' || selectedRun.status === 'paused');
 
   useEffect(() => {
     if (!selectedRunInProgress || !selectedRunId) return;
@@ -1018,6 +1019,34 @@ export function BacktestPanel({ projectId }: Props) {
     setLoading(false);
   }
 
+  async function handleStop(run: BacktestRun) {
+    setLoading(true);
+    try {
+      await postTrainingApi.stopBacktestRun(projectId, run.id);
+      await loadData();
+      if (selectedRun?.id === run.id) {
+        await handleViewRun(run);
+      }
+    } catch (e) {
+      alert(`Failed to stop run: ${(e as Error).message}`);
+    }
+    setLoading(false);
+  }
+
+  async function handleResume(run: BacktestRun) {
+    setLoading(true);
+    try {
+      await postTrainingApi.resumeBacktestRun(projectId, run.id);
+      await loadData();
+      if (selectedRun?.id === run.id) {
+        await handleViewRun(run);
+      }
+    } catch (e) {
+      alert(`Failed to resume run: ${(e as Error).message}`);
+    }
+    setLoading(false);
+  }
+
   async function handleCreateRun() {
     if (!runName.trim() || !runPromptVersionId || !runModelConfigId) return;
     setLoading(true);
@@ -1349,6 +1378,42 @@ export function BacktestPanel({ projectId }: Props) {
                 <CardTitle>{run.name}</CardTitle>
                 <Row style={{ gap: 6 }}>
                   <Badge color={getRunBadgeColor(run.status)}>{run.status}</Badge>
+                  {run.status === 'running' && (
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={(e) => { e.stopPropagation(); handleStop(run); }}
+                      disabled={loading}
+                      title="Stop the running backtest"
+                      style={{ padding: '2px 8px', fontSize: '0.72rem' }}
+                    >
+                      ⏹ Stop
+                    </Button>
+                  )}
+                  {run.status === 'paused' && (
+                    <>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        onClick={(e) => { e.stopPropagation(); handleResume(run); }}
+                        disabled={loading}
+                        title="Resume the paused backtest from where it left off"
+                        style={{ padding: '2px 8px', fontSize: '0.72rem' }}
+                      >
+                        ▶ Resume
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        onClick={(e) => { e.stopPropagation(); handleRerun(run); }}
+                        disabled={loading}
+                        title="Re-run all test cases from the start"
+                        style={{ padding: '2px 8px', fontSize: '0.72rem' }}
+                      >
+                        ↻ Re-run
+                      </Button>
+                    </>
+                  )}
                   {run.status === 'completed' && (
                     <Button
                       size="sm"
@@ -1486,6 +1551,50 @@ export function BacktestPanel({ projectId }: Props) {
               <ModalTitle>{selectedRun.name}</ModalTitle>
               <Row>
                 <Badge color={getRunBadgeColor(selectedRun.status)}>{selectedRun.status}</Badge>
+                {selectedRun.status === 'running' && (
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => { handleStop(selectedRun); setSelectedRun(null); }}
+                    disabled={loading}
+                    title="Stop the running backtest"
+                  >
+                    ⏹ Stop
+                  </Button>
+                )}
+                {selectedRun.status === 'paused' && (
+                  <>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => { handleResume(selectedRun); setSelectedRun(null); }}
+                      disabled={loading}
+                      title="Resume the paused backtest from where it left off"
+                    >
+                      ▶ Resume
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => { handleRerun(selectedRun); setSelectedRun(null); }}
+                      disabled={loading}
+                      title="Re-run all test cases from the start"
+                    >
+                      ↻ Re-run
+                    </Button>
+                  </>
+                )}
+                {selectedRun.status === 'completed' && (
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => { handleRerun(selectedRun); setSelectedRun(null); }}
+                    disabled={loading}
+                    title="Re-run with the same prompt, model, and test cases"
+                  >
+                    ↻ Re-run
+                  </Button>
+                )}
                 <Button
                   size="sm"
                   variant="ghost"

@@ -34,8 +34,45 @@ Empty or near-empty content is "trash".
 """
 
 
+async def _should_stop_eval(dataset_id: str) -> bool:
+    """Return True when the worker should bail out of the item loop.
+
+    The worker only continues while the dataset's ``eval_status`` is still
+    ``"running"`` — the value it was set to when this task was dispatched.
+    Any other value means someone else changed it:
+
+    - ``"cancelling"`` — user clicked Cancel (cooperative)
+    - ``"idle"`` — user clicked Force Reset, or the dataset was just cleaned
+    - dataset gone — the dataset itself was deleted
+
+    Treating all three as "stop" makes Force Reset actually stop the worker
+    (otherwise it'd lie to the UI while the worker kept burning model quota).
+    """
+    from app.models.input_dataset import InputDataset
+    async with async_session() as db:
+        ds = await db.get(InputDataset, dataset_id)
+        return not ds or ds.eval_status != "running"
+
+
+# Per-item ceiling on the LLM call. If the chosen model is unreachable or
+# hangs (the failure mode the user hit), we abandon that item with an error
+# instead of locking the whole dataset forever.
+EVAL_ITEM_TIMEOUT_SECONDS = 90
+
+
 async def evaluate_quality_for_dataset(dataset_id: str, model_config_id: str) -> None:
-    """Loop ready items in the dataset and ask the LLM to classify text quality."""
+    """Loop ready items in the dataset and ask the LLM to classify text quality.
+
+    Cooperative cancel: between items, the loop re-reads `eval_status`. If it
+    flipped to ``"cancelling"`` (via the cancel route), we break early and
+    leave any remaining items as ``"unchecked"`` so the user can re-run later.
+
+    Per-item timeout: ``provider.generate()`` is wrapped in ``asyncio.wait_for``
+    so a single hung model call can't block the rest of the dataset.
+
+    The ``finally`` block always restores ``eval_status`` to ``"idle"`` —
+    whether we exit normally, via cancel, via timeout, or on error.
+    """
     from app.models.input_dataset import InputDataset
     from sqlalchemy import select
 
@@ -64,6 +101,17 @@ async def evaluate_quality_for_dataset(dataset_id: str, model_config_id: str) ->
             extra_params.setdefault("adapter_path", model_config.adapter_path)
 
         for item in items:
+            # Cooperative cancel: bail out between items if the user clicked
+            # "Cancel" or "Force Reset" since the last iteration. Items
+            # already classified keep their result; remaining items stay
+            # "unchecked".
+            if await _should_stop_eval(dataset_id):
+                logger.info(
+                    "evaluate_quality: stop signal for dataset %s — exiting loop",
+                    dataset_id,
+                )
+                break
+
             content = (item.content or "").strip()
             if not content:
                 quality = "trash"
@@ -75,12 +123,15 @@ async def evaluate_quality_for_dataset(dataset_id: str, model_config_id: str) ->
                     {"role": "user", "content": f"Text to classify:\n\n{preview}"},
                 ]
                 try:
-                    response = await provider.generate(
-                        messages=messages,
-                        model_id=model_config.model_id,
-                        max_tokens=200,
-                        temperature=0.0,
-                        **extra_params,
+                    response = await asyncio.wait_for(
+                        provider.generate(
+                            messages=messages,
+                            model_id=model_config.model_id,
+                            max_tokens=200,
+                            temperature=0.0,
+                            **extra_params,
+                        ),
+                        timeout=EVAL_ITEM_TIMEOUT_SECONDS,
                     )
                     raw = (response.content or "").strip()
                     start = raw.find("{")
@@ -95,6 +146,13 @@ async def evaluate_quality_for_dataset(dataset_id: str, model_config_id: str) ->
                     else:
                         quality = "unchecked"
                         reason = f"No JSON found in response: {raw[:200]}"
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Quality evaluation timed out for item %s after %ds",
+                        item.id, EVAL_ITEM_TIMEOUT_SECONDS,
+                    )
+                    quality = "unchecked"
+                    reason = f"Eval timed out after {EVAL_ITEM_TIMEOUT_SECONDS}s — model may be unreachable"
                 except Exception as e:
                     logger.exception("Quality evaluation failed for item %s", item.id)
                     quality = "unchecked"
@@ -107,7 +165,7 @@ async def evaluate_quality_for_dataset(dataset_id: str, model_config_id: str) ->
                     db_item.quality_reason = reason
                     await db.commit()
     finally:
-        # Always clear the running flag, even on error
+        # Always clear the running flag, even on error / cancel / timeout.
         async with async_session() as db:
             ds = await db.get(InputDataset, dataset_id)
             if ds:

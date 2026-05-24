@@ -199,6 +199,7 @@ const EMPTY_FORM = {
   max_tokens: 4096,
   temperature: 0.7,
   adapter_path: '',
+  enable_thinking: true,
   is_enabled: true,
 };
 
@@ -232,6 +233,7 @@ export function ModelConfigForm({ open, onClose, editModel }: Props) {
         max_tokens: editModel.max_tokens,
         temperature: editModel.temperature,
         adapter_path: editModel.adapter_path || '',
+        enable_thinking: editModel.enable_thinking ?? true,
         is_enabled: editModel.is_enabled,
       });
     } else if (!editModel && open) {
@@ -279,6 +281,7 @@ export function ModelConfigForm({ open, onClose, editModel }: Props) {
           max_tokens: form.max_tokens,
           temperature: form.temperature,
           adapter_path: form.adapter_path || null,
+          enable_thinking: form.enable_thinking,
           is_enabled: form.is_enabled,
         };
         if (form.api_key) data.api_key = form.api_key;
@@ -294,6 +297,7 @@ export function ModelConfigForm({ open, onClose, editModel }: Props) {
           max_tokens: form.max_tokens,
           temperature: form.temperature,
           adapter_path: form.adapter_path || undefined,
+          enable_thinking: form.enable_thinking,
         });
       }
       setForm(EMPTY_FORM);
@@ -489,7 +493,7 @@ export function ModelConfigForm({ open, onClose, editModel }: Props) {
               <Slider
                 type="range"
                 min={128}
-                max={32768}
+                max={131072}
                 step={128}
                 value={form.max_tokens}
                 onChange={(e) => update('max_tokens', parseInt(e.target.value))}
@@ -497,7 +501,7 @@ export function ModelConfigForm({ open, onClose, editModel }: Props) {
               <SliderValue>{form.max_tokens.toLocaleString()}</SliderValue>
             </SliderRow>
             <Presets>
-              {[1024, 2048, 4096, 8192, 16384, 32768].map((v) => (
+              {[1024, 4096, 8192, 16384, 32768, 65536, 131072].map((v) => (
                 <PresetChip
                   key={v}
                   $active={form.max_tokens === v}
@@ -512,6 +516,26 @@ export function ModelConfigForm({ open, onClose, editModel }: Props) {
         {form.max_tokens === 0 && (
           <ParamHint>The model will decide when to stop generating.</ParamHint>
         )}
+      </FormGroup>
+
+      <FormGroup>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <Label style={{ marginBottom: 0 }}>Thinking / Reasoning</Label>
+          <ToggleRow>
+            <ToggleLabel>{form.enable_thinking ? 'On' : 'Off'}</ToggleLabel>
+            <Toggle
+              $active={form.enable_thinking}
+              onClick={() => update('enable_thinking', !form.enable_thinking)}
+            >
+              <ToggleKnob $active={form.enable_thinking} />
+            </Toggle>
+          </ToggleRow>
+        </div>
+        <ParamHint>
+          {form.enable_thinking
+            ? 'Model uses its built-in reasoning/thinking mode (default).'
+            : "Skips the <think>…</think> phase entirely on supported models (Qwen3 via MLX). Saves output tokens and prevents thinking text from leaking into JSON outputs."}
+        </ParamHint>
       </FormGroup>
 
       <FormGroup>

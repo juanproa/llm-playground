@@ -43,7 +43,13 @@ async def update_prompt(prompt_id: str, data: PromptUpdate, db: AsyncSession = D
 
 @router.delete("/prompts/{prompt_id}", status_code=204)
 async def delete_prompt(prompt_id: str, db: AsyncSession = Depends(get_db)):
-    if not await prompt_service.delete_prompt(db, prompt_id):
+    try:
+        deleted = await prompt_service.delete_prompt(db, prompt_id)
+    except prompt_service.PromptDeleteError as exc:
+        # 400 + friendly detail — matches the per-version delete endpoint so the
+        # frontend can surface the message in its existing alert path.
+        raise HTTPException(status_code=400, detail=exc.message)
+    if not deleted:
         raise HTTPException(status_code=404, detail="Prompt not found")
 
 

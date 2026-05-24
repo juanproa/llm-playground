@@ -5,7 +5,7 @@ import csv
 import io
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
 from fastapi.responses import PlainTextResponse
@@ -31,11 +31,16 @@ from app.models.post_training import (
     TrainingJob,
 )
 from app.schemas.post_training import (
+    ApplyCleanupRequest,
+    ApplyCleanupResponse,
     ArtifactInfo,
     BacktestResultResponse,
     BacktestRunCreate,
     BacktestRunResponse,
     BacktestRunWithResultsResponse,
+    CleanupPreviewRequest,
+    CleanupPreviewResponse,
+    CleanupRuleInfo,
     ComparisonRunCreate,
     ComparisonRunResponse,
     ComparisonRunWithChildrenResponse,
@@ -52,21 +57,26 @@ from app.schemas.post_training import (
     FeedbackRunResponse,
     FeedbackRunWithItemsResponse,
     FeedbackSubmit,
+    FilterByTokensRequest,
+    FilterByTokensResponse,
     FusionArtifactInfo,
     FusionJobCreate,
     FusionJobResponse,
     HfModelInfo,
+    MergeDatasetsRequest,
     MlxModelInfo,
     SyntheticJobCreate,
     SyntheticJobResponse,
     TestCaseCreate,
     TestCaseResponse,
     TestCaseUpdate,
+    TokenStatsRequest,
+    TokenStatsResponse,
     TrainingBackendInfo,
     TrainingJobCreate,
     TrainingJobResponse,
 )
-from app.services import backtest_service, comparison_service, dataset_cleaner, feedback_service, fusion_service, sft_service, synthetic_data_service, test_case_pii_service
+from app.services import backtest_service, comparison_service, dataset_cleaner, dataset_studio_service, feedback_service, fusion_service, sft_service, synthetic_data_service, test_case_pii_service
 from app.services.mlx_catalog import KNOWN_HF_MODELS, KNOWN_MLX_MODELS
 from app.services.pdf_parser import parse_pdf
 
@@ -1238,6 +1248,67 @@ async def delete_backtest_run(project_id: str, run_id: str, db: AsyncSession = D
     await db.delete(run)  # cascade deletes BacktestResult rows via relationship
 
 
+@router.post(f"{PREFIX}/backtest-runs/{{run_id}}/stop", response_model=BacktestRunResponse)
+async def stop_backtest_run(project_id: str, run_id: str, db: AsyncSession = Depends(get_db)):
+    """Stop an in-progress backtest run. Idempotent — already-paused/completed runs return as-is."""
+    run = await db.get(BacktestRun, run_id)
+    if not run or run.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Backtest run not found")
+
+    # Only pause if currently running/pending; ignore if already terminal
+    if run.status in ("pending", "running"):
+        run.status = "paused"
+        await db.commit()
+
+    return run
+
+
+@router.post(f"{PREFIX}/backtest-runs/{{run_id}}/resume", response_model=BacktestRunResponse)
+async def resume_backtest_run(
+    project_id: str, run_id: str, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)
+):
+    """Resume a paused backtest run. Only pending test cases will be re-executed."""
+    run = await db.get(BacktestRun, run_id)
+    if not run or run.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Backtest run not found")
+
+    if run.status != "paused":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot resume run with status '{run.status}'; only paused runs can be resumed",
+        )
+
+    # Check if there are pending results to execute
+    result = await db.execute(
+        select(BacktestResult).where(
+            BacktestResult.backtest_run_id == run_id,
+            BacktestResult.status == "pending",
+        )
+    )
+    pending_count = len(list(result.scalars().all()))
+
+    if pending_count == 0:
+        # No pending results — mark as completed and return
+        run.status = "completed"
+        run.completed_at = datetime.now(timezone.utc)
+        await db.commit()
+        return run
+
+    # Mark as pending so the background task will pick it up and run it
+    run.status = "pending"
+    await db.commit()
+
+    async def _run_backtest():
+        try:
+            await backtest_service.run_backtest(backtest_run_id=run_id)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).error("Background backtest resume failed: %s", e)
+
+    background_tasks.add_task(_run_backtest)
+    return run
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # COMPARISON RUNS (multi-model batch compare)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1439,3 +1510,171 @@ async def list_fusion_artifacts():
 async def delete_fusion_artifact(fusion_id: str):
     if not fusion_service.delete_fusion_artifact(fusion_id):
         raise HTTPException(status_code=404, detail="Artifact not found")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DATASET STUDIO — curation tools for SFT datasets (pt_datasets)
+# ═══════════════════════════════════════════════════════════════════════════════
+# All endpoints operate on Concept #3 (SFT Dataset) and are non-destructive:
+# they ALWAYS create a new pt_dataset rather than mutating the source.
+
+
+def _custom_rules_from_specs(specs) -> list[dataset_studio_service.CustomRule]:
+    """Convert request CustomRuleSpec objects to service-layer CustomRule dataclasses."""
+    return [
+        dataset_studio_service.CustomRule(
+            pattern=s.pattern,
+            replacement=s.replacement,
+            name=s.name,
+            flags=re.MULTILINE if s.multiline else 0,
+        )
+        for s in specs
+    ]
+
+
+@router.get(f"{PREFIX}/dataset-studio/cleanup-rules", response_model=list[CleanupRuleInfo])
+async def list_cleanup_rules(project_id: str):  # project_id unused — rules are static
+    """List the built-in cleanup rules. Each rule has a name, description,
+    tier (1-5), and a default_on flag the UI uses for initial state.
+    """
+    rules = dataset_studio_service.get_cleanup_rules()
+    return [
+        CleanupRuleInfo(
+            id=r["id"],
+            name=r["name"],
+            description=r["description"],
+            tier=r["tier"],
+            default_on=r["default_on"],
+            type=r["type"],
+            pattern=r.get("pattern"),
+        )
+        for r in rules
+    ]
+
+
+@router.post(f"{PREFIX}/dataset-studio/preview-cleanup", response_model=CleanupPreviewResponse)
+async def preview_cleanup_endpoint(
+    project_id: str, body: CleanupPreviewRequest, db: AsyncSession = Depends(get_db)
+):
+    """Dry-run cleanup on the first N items of the dataset. Returns before/after
+    samples plus dataset-wide character savings estimate.
+    """
+    try:
+        result = await dataset_studio_service.preview_cleanup(
+            db,
+            project_id=project_id,
+            source_dataset_id=body.source_dataset_id,
+            enabled_rule_ids=set(body.enabled_rule_ids),
+            custom_rules=_custom_rules_from_specs(body.custom_rules),
+            sample_size=max(1, min(10, body.sample_size)),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return CleanupPreviewResponse(**result)
+
+
+@router.post(f"{PREFIX}/dataset-studio/apply-cleanup", response_model=ApplyCleanupResponse, status_code=201)
+async def apply_cleanup_endpoint(
+    project_id: str, body: ApplyCleanupRequest, db: AsyncSession = Depends(get_db)
+):
+    """Apply cleanup rules to a dataset's `input_text` column and write the
+    result to a NEW dataset. Source dataset is untouched.
+    """
+    if not body.new_name.strip():
+        raise HTTPException(status_code=400, detail="new_name is required")
+
+    try:
+        new_dataset, stats = await dataset_studio_service.apply_cleanup_to_dataset(
+            db,
+            project_id=project_id,
+            source_dataset_id=body.source_dataset_id,
+            enabled_rule_ids=set(body.enabled_rule_ids),
+            custom_rules=_custom_rules_from_specs(body.custom_rules),
+            new_name=body.new_name.strip(),
+            new_description=body.new_description,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return ApplyCleanupResponse(
+        dataset=DatasetResponse.model_validate(new_dataset),
+        items=stats["items"],
+        input_chars_before=stats["input_chars_before"],
+        input_chars_after=stats["input_chars_after"],
+    )
+
+
+@router.post(f"{PREFIX}/dataset-studio/merge", response_model=DatasetResponse, status_code=201)
+async def merge_datasets_endpoint(
+    project_id: str, body: MergeDatasetsRequest, db: AsyncSession = Depends(get_db)
+):
+    """N-way merge of source datasets into a new dataset. Source datasets are untouched."""
+    if not body.new_name.strip():
+        raise HTTPException(status_code=400, detail="new_name is required")
+    if len(body.source_dataset_ids) < 1:
+        raise HTTPException(status_code=400, detail="At least one source dataset is required")
+
+    try:
+        new_dataset = await dataset_studio_service.merge_datasets(
+            db,
+            project_id=project_id,
+            source_dataset_ids=body.source_dataset_ids,
+            new_name=body.new_name.strip(),
+            new_description=body.new_description,
+            dedup_strategy=body.dedup_strategy,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return new_dataset
+
+
+@router.post(f"{PREFIX}/dataset-studio/token-stats", response_model=TokenStatsResponse)
+async def token_stats_endpoint(
+    project_id: str, body: TokenStatsRequest, db: AsyncSession = Depends(get_db)
+):
+    """Tokenize every item in the dataset and return distribution stats.
+
+    First call for a given model_id triggers a tokenizer download (~5-50MB).
+    Subsequent calls use the in-process cache and are near-instant.
+    """
+    # Verify the dataset belongs to this project
+    src = await db.get(Dataset, body.dataset_id)
+    if not src or src.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Dataset not found in this project")
+
+    result = await dataset_studio_service.compute_token_stats(
+        db, dataset_id=body.dataset_id, model_id=body.model_id
+    )
+    return TokenStatsResponse(**result)
+
+
+@router.post(f"{PREFIX}/dataset-studio/filter-by-tokens", response_model=FilterByTokensResponse, status_code=201)
+async def filter_by_tokens_endpoint(
+    project_id: str, body: FilterByTokensRequest, db: AsyncSession = Depends(get_db)
+):
+    """Create a new dataset containing only items with combined token count <= max_tokens."""
+    if not body.new_name.strip():
+        raise HTTPException(status_code=400, detail="new_name is required")
+    if body.max_tokens <= 0:
+        raise HTTPException(status_code=400, detail="max_tokens must be positive")
+
+    try:
+        new_dataset, stats = await dataset_studio_service.filter_by_tokens(
+            db,
+            project_id=project_id,
+            source_dataset_id=body.source_dataset_id,
+            model_id=body.model_id,
+            max_tokens=body.max_tokens,
+            new_name=body.new_name.strip(),
+            new_description=body.new_description,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return FilterByTokensResponse(
+        dataset=DatasetResponse.model_validate(new_dataset),
+        kept=stats["kept"],
+        dropped=stats["dropped"],
+        total=stats["total"],
+    )

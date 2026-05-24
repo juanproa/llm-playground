@@ -112,10 +112,19 @@ export function PromptEditor({ projectId, prompts, selectedPrompt, selectedVersi
   const handleDeletePrompt = async () => {
     if (!selectedPrompt) return;
     if (!confirm(`Delete prompt "${selectedPrompt.name}" and all its versions?`)) return;
-    await deletePrompt(selectedPrompt.id);
-    onSelectPrompt(null);
-    onSelectVersion(null);
-    await fetchPrompts(projectId);
+    try {
+      await deletePrompt(selectedPrompt.id);
+      onSelectPrompt(null);
+      onSelectVersion(null);
+      await fetchPrompts(projectId);
+    } catch (err) {
+      // Backend returns 400 with a friendly detail when curated artifacts
+      // (backtest/comparison/feedback runs or chain nodes) still reference
+      // this prompt's versions. Surface that to the user instead of leaving
+      // the click looking like a no-op.
+      const message = err instanceof Error ? err.message : 'Failed to delete prompt';
+      alert(message);
+    }
   };
 
   const handleSaveEdit = async () => {

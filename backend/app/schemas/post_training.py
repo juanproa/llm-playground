@@ -539,3 +539,114 @@ class SyntheticJobResponse(BaseModel):
     started_at: datetime | None
     completed_at: datetime | None
     created_at: datetime
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DATASET STUDIO (transformations on pt_datasets)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class CleanupRuleInfo(BaseModel):
+    """Built-in cleanup rule metadata (frontend renders these as togglable checkboxes)."""
+    id: str
+    name: str
+    description: str
+    tier: int
+    default_on: bool
+    type: str  # "regex" | "function"
+    pattern: str | None = None  # for "regex" type only — shown in tooltip
+
+
+class CustomRuleSpec(BaseModel):
+    """User-supplied ephemeral regex rule. Not persisted."""
+    pattern: str
+    replacement: str = ""
+    name: str = "custom"
+    multiline: bool = False  # convenience: sets re.MULTILINE flag
+
+
+class CleanupPreviewRequest(BaseModel):
+    """Body for /dataset-studio/preview-cleanup."""
+    source_dataset_id: str
+    enabled_rule_ids: list[str]
+    custom_rules: list[CustomRuleSpec] = []
+    sample_size: int = 3
+
+
+class CleanupSample(BaseModel):
+    id: str
+    name: str | None
+    before: str
+    after: str
+    chars_before: int
+    chars_after: int
+
+
+class CleanupPreviewResponse(BaseModel):
+    samples: list[CleanupSample]
+    total_chars_before: int
+    total_chars_after: int
+    total_items: int
+    estimated_savings_pct: float
+
+
+class ApplyCleanupRequest(BaseModel):
+    """Body for /dataset-studio/apply-cleanup."""
+    source_dataset_id: str
+    enabled_rule_ids: list[str]
+    custom_rules: list[CustomRuleSpec] = []
+    new_name: str
+    new_description: str | None = None
+
+
+class ApplyCleanupResponse(BaseModel):
+    dataset: DatasetResponse
+    items: int
+    input_chars_before: int
+    input_chars_after: int
+
+
+class MergeDatasetsRequest(BaseModel):
+    """Body for /dataset-studio/merge."""
+    source_dataset_ids: list[str]
+    new_name: str
+    new_description: str | None = None
+    dedup_strategy: str = "none"  # "none" | "exact" | "input_only"
+
+
+class TokenStatsRequest(BaseModel):
+    """Body for /dataset-studio/token-stats."""
+    dataset_id: str
+    model_id: str  # HuggingFace repo id, e.g. "Qwen/Qwen3-4B-FP8"
+
+
+class TokenStatsItemEntry(BaseModel):
+    id: str
+    name: str | None
+    token_count: int
+
+
+class TokenStatsResponse(BaseModel):
+    total_items: int
+    tokenizer_loaded: bool
+    model_id: str
+    stats: dict[str, int] = {}  # min, max, mean, p50, p75, p90, p95, p99
+    items: list[TokenStatsItemEntry] = []
+    histogram: dict[str, list[int]] = {"bin_edges": [], "counts": []}
+    error: str | None = None
+
+
+class FilterByTokensRequest(BaseModel):
+    """Body for /dataset-studio/filter-by-tokens."""
+    source_dataset_id: str
+    model_id: str
+    max_tokens: int
+    new_name: str
+    new_description: str | None = None
+
+
+class FilterByTokensResponse(BaseModel):
+    dataset: DatasetResponse
+    kept: int
+    dropped: int
+    total: int

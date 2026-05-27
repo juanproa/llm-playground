@@ -210,7 +210,7 @@ async def mask_pii_for_project_test_cases(project_id: str) -> None:
             new_masked: str | None = None
         else:
             try:
-                outcome = await asyncio.to_thread(
+                outcome = await pii_filter_service.run_in_mlx_thread(
                     pii_filter_service.detect_and_mask, content
                 )
                 if outcome["has_pii"]:

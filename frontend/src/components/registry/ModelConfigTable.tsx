@@ -149,9 +149,13 @@ export function ModelConfigTable({ models, onEdit }: Props) {
     }
   };
 
-  const handleDelete = (model: ModelConfig) => {
+  const handleDelete = async (model: ModelConfig) => {
     if (!confirm(`Delete model "${model.name}"?`)) return;
-    deleteModel(model.id);
+    try {
+      await deleteModel(model.id);
+    } catch (e) {
+      alert((e as Error).message);
+    }
   };
 
   // Fetch MLX status once on mount for any mlx_local rows

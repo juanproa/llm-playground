@@ -9,9 +9,11 @@ BIOES labels: O + {B,I,E,S}-{account_number, private_address, private_date,
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +23,10 @@ _MODEL_CACHE: tuple | None = None   # (model, id2label, tokenizer)
 _MODEL_LOCK = threading.Lock()
 _INFER_LOCK = threading.Lock()
 _PRELOAD_STATUS: dict = {}
+
+# Single dedicated thread — MLX GPU streams are thread-local, so load and
+# inference must always run on the same thread.
+_MLX_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mlx-pii")
 
 
 # ── HF-cache helpers ──────────────────────────────────────────────────────────
@@ -103,7 +109,7 @@ def preload_async() -> dict:
             logger.exception("PII filter preload failed")
             _PRELOAD_STATUS.update({"state": "error", "error": str(e)})
 
-    threading.Thread(target=_run, daemon=True, name="pii-preload").start()
+    _MLX_EXECUTOR.submit(_run)
     return get_status()
 
 
@@ -190,3 +196,9 @@ def detect_and_mask(text: str) -> dict:
         pii_types.add(ent)
 
     return {"has_pii": True, "masked_content": masked, "pii_types": sorted(pii_types)}
+
+
+async def run_in_mlx_thread(fn, *args):
+    """Run a synchronous MLX function on the dedicated MLX thread."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_MLX_EXECUTOR, fn, *args)

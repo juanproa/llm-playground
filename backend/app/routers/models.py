@@ -72,8 +72,11 @@ async def update_model(model_id: str, data: ModelConfigUpdate, db: AsyncSession 
 
 @router.delete("/{model_id}", status_code=204)
 async def delete_model(model_id: str, db: AsyncSession = Depends(get_db)):
-    if not await model_config_service.delete_model(db, model_id):
+    result = await model_config_service.delete_model(db, model_id)
+    if result is False:
         raise HTTPException(status_code=404, detail="Model not found")
+    if isinstance(result, str):
+        raise HTTPException(status_code=409, detail=result)
 
 
 @router.get("/{model_id}/mlx-status")

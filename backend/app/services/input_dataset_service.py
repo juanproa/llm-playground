@@ -199,7 +199,7 @@ async def mask_pii_for_dataset(dataset_id: str) -> None:
                 pii_masked_content = None
             else:
                 try:
-                    result = await asyncio.to_thread(pii_filter_service.detect_and_mask, content)
+                    result = await pii_filter_service.run_in_mlx_thread(pii_filter_service.detect_and_mask, content)
                     if result["has_pii"]:
                         pii_status = "masked"
                         pii_masked_content = result["masked_content"]

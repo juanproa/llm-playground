@@ -139,7 +139,7 @@ async def create_comparison_run(
             )
         # Project policy: batch compares may only run on PII-masked data
         # sourced from datasets. Refuse if any selected item is unmasked.
-        unmasked = [it for it in items if it.pii_status != "masked"]
+        unmasked = [it for it in items if it.pii_status not in ("masked", "clean")]
         if unmasked:
             preview = ", ".join((it.name or it.id[:8]) for it in unmasked[:5])
             raise ValueError(

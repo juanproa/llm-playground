@@ -1,9 +1,13 @@
 from cryptography.fernet import Fernet
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.models.chat import ChatSession
+from app.models.future import Artifact
+from app.models.inference import InferenceRun
 from app.models.model_config import ModelConfig
+from app.models.post_training import BacktestRun, ComparisonChild, ComparisonRun, FeedbackRun
 from app.schemas.model_config import ModelConfigCreate, ModelConfigUpdate
 
 
@@ -73,10 +77,46 @@ async def update_model(db: AsyncSession, model_id: str, data: ModelConfigUpdate)
     return model
 
 
-async def delete_model(db: AsyncSession, model_id: str) -> bool:
+async def delete_model(db: AsyncSession, model_id: str) -> bool | str:
+    """Delete a model config.
+
+    Returns True on success, False if not found, or a string error message if
+    the model is still referenced by non-nullable foreign keys.
+    """
     model = await db.get(ModelConfig, model_id)
     if not model:
         return False
+
+    # Check non-nullable FK references — can't nullify these.
+    blocking: list[str] = []
+    for table_cls, col_name, label in [
+        (InferenceRun, "model_config_id", "inference runs"),
+        (ChatSession, "model_config_id", "chat sessions"),
+        (BacktestRun, "model_config_id", "backtest runs"),
+    ]:
+        result = await db.execute(
+            select(table_cls).where(getattr(table_cls, col_name) == model_id).limit(1)
+        )
+        if result.scalars().first():
+            blocking.append(label)
+
+    if blocking:
+        return f"Model is still referenced by: {', '.join(blocking)}. Delete those first."
+
+    # Nullify nullable FK references before deleting.
+    for table_cls, col_name in [
+        (FeedbackRun, "model_config_id"),
+        (BacktestRun, "judge_model_config_id"),
+        (ComparisonRun, "judge_model_config_id"),
+        (ComparisonChild, "model_config_id"),
+        (Artifact, "parent_model_config_id"),
+    ]:
+        await db.execute(
+            update(table_cls)
+            .where(getattr(table_cls, col_name) == model_id)
+            .values({col_name: None})
+        )
+
     await db.delete(model)
     await db.flush()
     return True

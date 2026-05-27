@@ -591,6 +591,7 @@ export function BacktestPanel({ projectId }: Props) {
   const [runModelConfigId, setRunModelConfigId] = useState('');
   const [runPassThreshold, setRunPassThreshold] = useState(0.5);
   const [runJudgeModelId, setRunJudgeModelId] = useState('');
+  const [runCaseLimit, setRunCaseLimit] = useState<string>('');
 
   useEffect(() => {
     fetchPrompts(projectId);
@@ -1051,17 +1052,21 @@ export function BacktestPanel({ projectId }: Props) {
     if (!runName.trim() || !runPromptVersionId || !runModelConfigId) return;
     setLoading(true);
     try {
+      const limit = runCaseLimit !== '' ? parseInt(runCaseLimit, 10) : null;
+      const caseIds = limit && limit > 0 ? testCases.slice(0, limit).map((tc) => tc.id) : undefined;
       await postTrainingApi.createBacktestRun(projectId, {
         name: runName,
         prompt_version_id: runPromptVersionId,
         model_config_id: runModelConfigId,
         pass_threshold: runPassThreshold,
         judge_model_config_id: runJudgeModelId || undefined,
+        test_case_ids: caseIds,
       });
       setRunName('');
       setRunPromptVersionId('');
       setRunModelConfigId('');
       setRunPassThreshold(0.5);
+      setRunCaseLimit('');
       setShowRunModal(false);
       await loadData();
     } catch (e) {
@@ -1529,9 +1534,21 @@ export function BacktestPanel({ projectId }: Props) {
                   generative tasks. Uses Claude/GPT-4 well.
                 </CardMeta>
               </FormGroup>
-              <CardMeta style={{ marginBottom: tokens.spacing.md }}>
-                Will run against all {testCases.length} test cases.
-              </CardMeta>
+              <FormGroup>
+                <Label>Limit cases (optional)</Label>
+                <Input
+                  type="number"
+                  min={1}
+                  max={testCases.length}
+                  placeholder={`All ${testCases.length}`}
+                  value={runCaseLimit}
+                  onChange={(e) => setRunCaseLimit(e.target.value)}
+                  style={{ width: 120 }}
+                />
+                <CardMeta style={{ marginTop: 2 }}>
+                  Run only the first N test cases. Leave blank to use all {testCases.length}.
+                </CardMeta>
+              </FormGroup>
               <Button
                 disabled={loading || !runName.trim() || !runPromptVersionId || !runModelConfigId}
                 onClick={handleCreateRun}

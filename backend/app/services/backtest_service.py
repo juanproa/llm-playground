@@ -27,13 +27,11 @@ from app.services.model_config_service import decrypt_api_key
 logger = logging.getLogger(__name__)
 
 MAX_CONCURRENT = 1
-# "No limit" sentinel: when the user sets max_tokens=0 in Model Registry, we
-# fall back to this value. Sized for reasoning models — the previous 4096
-# (and even 32k) was too tight and caused models like Gemini 2.5 / Qwen3 to
-# exhaust the budget on chain-of-thought before producing the visible answer.
-# Matches the frontend slider max so "No limit" truly means "as high as the
-# UI allows you to set explicitly."
-DEFAULT_MAX_TOKENS = 131072
+# Fallback when the user sets max_tokens=0 ("No limit") in Model Registry.
+# Capped at 4096 — enough for any realistic answer while preventing reasoning
+# models from burning through 100k+ tokens of chain-of-thought and making
+# each backtest case take 10+ minutes.
+DEFAULT_MAX_TOKENS = 4096
 
 
 async def _stream_to_response(provider, **kwargs) -> LLMResponse:

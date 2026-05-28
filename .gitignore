@@ -7,7 +7,11 @@ build/
 *.egg
 .env
 *.db
+*.db-shm
+*.db-wal
 *.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
 backend/uploads/*
 !backend/uploads/.gitkeep
 .venv/

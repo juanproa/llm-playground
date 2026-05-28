@@ -388,14 +388,26 @@ class MlxLocalProvider:
             model, tokenizer = _load_cached(model_id, adapter_path)
             prompt = _format_prompt(tokenizer, messages, enable_thinking=enable_thinking)
             sampler = make_sampler(temp=temperature)
-            return generate(
-                model,
-                tokenizer,
-                prompt=prompt,
-                max_tokens=max_tokens,
-                sampler=sampler,
-                verbose=False,
-            )
+            try:
+                return generate(
+                    model,
+                    tokenizer,
+                    prompt=prompt,
+                    max_tokens=max_tokens,
+                    sampler=sampler,
+                    verbose=False,
+                )
+            finally:
+                # Release Metal KV-cache buffers after each inference so they
+                # don't accumulate across backtest cases and push unified memory
+                # into the yellow/red pressure zone.  This is the primary cause
+                # of the "each case takes longer and longer" slowdown pattern.
+                try:
+                    import mlx.core as mx  # type: ignore
+                    if hasattr(mx.metal, "clear_cache"):
+                        mx.metal.clear_cache()
+                except Exception:
+                    pass
 
     async def generate(
         self,
@@ -451,17 +463,28 @@ class MlxLocalProvider:
                     prompt = _format_prompt(tokenizer, messages, enable_thinking=enable_thinking)
                     sampler = make_sampler(temp=temperature)
 
-                    for resp in stream_generate(
-                        model,
-                        tokenizer,
-                        prompt=prompt,
-                        max_tokens=max_tokens,
-                        sampler=sampler,
-                    ):
-                        # GenerationResponse.text is the incremental delta
-                        chunk = getattr(resp, "text", None) or ""
-                        if chunk:
-                            asyncio.run_coroutine_threadsafe(queue.put(chunk), loop)
+                    try:
+                        for resp in stream_generate(
+                            model,
+                            tokenizer,
+                            prompt=prompt,
+                            max_tokens=max_tokens,
+                            sampler=sampler,
+                        ):
+                            # GenerationResponse.text is the incremental delta
+                            chunk = getattr(resp, "text", None) or ""
+                            if chunk:
+                                asyncio.run_coroutine_threadsafe(queue.put(chunk), loop)
+                    finally:
+                        # Release Metal KV-cache buffers after each stream so they
+                        # don't accumulate across backtest cases and push unified
+                        # memory into the yellow/red pressure zone.
+                        try:
+                            import mlx.core as mx  # type: ignore
+                            if hasattr(mx.metal, "clear_cache"):
+                                mx.metal.clear_cache()
+                        except Exception:
+                            pass
             except Exception as e:
                 logger.exception("MLX stream worker failed: %s", e)
                 asyncio.run_coroutine_threadsafe(

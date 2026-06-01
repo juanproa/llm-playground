@@ -24,6 +24,16 @@ def _to_response(model) -> ModelConfigResponse:
         # a default of 1; coerce to True so the UI toggle never lands in an
         # undefined state.
         enable_thinking=bool(getattr(model, "enable_thinking", True) if getattr(model, "enable_thinking", None) is not None else True),
+        top_p=getattr(model, "top_p", None),
+        top_k=getattr(model, "top_k", None),
+        min_p=getattr(model, "min_p", None),
+        yarn_factor=getattr(model, "yarn_factor", None),
+        yarn_original_max_position_embeddings=getattr(model, "yarn_original_max_position_embeddings", None),
+        q_bits=getattr(model, "q_bits", None),
+        q_group_size=getattr(model, "q_group_size", None),
+        kv_bits=getattr(model, "kv_bits", None),
+        kv_group_size=getattr(model, "kv_group_size", None),
+        max_kv_size=getattr(model, "max_kv_size", None),
         is_enabled=model.is_enabled,
         has_api_key=model.api_key_encrypted is not None,
         created_at=model.created_at,

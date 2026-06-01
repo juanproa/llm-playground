@@ -592,6 +592,7 @@ export function BacktestPanel({ projectId }: Props) {
   const [runPassThreshold, setRunPassThreshold] = useState(0.5);
   const [runJudgeModelId, setRunJudgeModelId] = useState('');
   const [runCaseLimit, setRunCaseLimit] = useState<string>('');
+  const [runCaseLimitLast, setRunCaseLimitLast] = useState<string>('');
 
   useEffect(() => {
     fetchPrompts(projectId);
@@ -1053,7 +1054,12 @@ export function BacktestPanel({ projectId }: Props) {
     setLoading(true);
     try {
       const limit = runCaseLimit !== '' ? parseInt(runCaseLimit, 10) : null;
-      const caseIds = limit && limit > 0 ? testCases.slice(0, limit).map((tc) => tc.id) : undefined;
+      const limitLast = runCaseLimitLast !== '' ? parseInt(runCaseLimitLast, 10) : null;
+      const caseIds = limitLast && limitLast > 0
+        ? testCases.slice(-limitLast).map((tc) => tc.id)
+        : limit && limit > 0
+          ? testCases.slice(0, limit).map((tc) => tc.id)
+          : undefined;
       await postTrainingApi.createBacktestRun(projectId, {
         name: runName,
         prompt_version_id: runPromptVersionId,
@@ -1535,18 +1541,33 @@ export function BacktestPanel({ projectId }: Props) {
                 </CardMeta>
               </FormGroup>
               <FormGroup>
-                <Label>Limit cases (optional)</Label>
+                <Label>First N cases (optional)</Label>
                 <Input
                   type="number"
                   min={1}
                   max={testCases.length}
                   placeholder={`All ${testCases.length}`}
                   value={runCaseLimit}
-                  onChange={(e) => setRunCaseLimit(e.target.value)}
+                  onChange={(e) => { setRunCaseLimit(e.target.value); if (e.target.value) setRunCaseLimitLast(''); }}
                   style={{ width: 120 }}
                 />
                 <CardMeta style={{ marginTop: 2 }}>
                   Run only the first N test cases. Leave blank to use all {testCases.length}.
+                </CardMeta>
+              </FormGroup>
+              <FormGroup>
+                <Label>Last N cases (optional)</Label>
+                <Input
+                  type="number"
+                  min={1}
+                  max={testCases.length}
+                  placeholder={`All ${testCases.length}`}
+                  value={runCaseLimitLast}
+                  onChange={(e) => { setRunCaseLimitLast(e.target.value); if (e.target.value) setRunCaseLimit(''); }}
+                  style={{ width: 120 }}
+                />
+                <CardMeta style={{ marginTop: 2 }}>
+                  Run only the last N test cases. Leave blank to use all {testCases.length}.
                 </CardMeta>
               </FormGroup>
               <Button
@@ -1690,7 +1711,7 @@ export function BacktestPanel({ projectId }: Props) {
                         <Td>
                           {r.latency_ms != null ? (
                             <span style={{ fontFamily: tokens.fonts.mono, fontSize: '0.75rem' }}>
-                              {r.latency_ms}ms
+                              {(r.latency_ms / 1000).toFixed(2)}s
                             </span>
                           ) : '—'}
                         </Td>

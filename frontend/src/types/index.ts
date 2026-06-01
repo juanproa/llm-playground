@@ -41,6 +41,20 @@ export interface ModelConfig {
   extra_params: Record<string, unknown> | null;
   adapter_path: string | null;
   enable_thinking: boolean;
+  // YaRN context extension (mlx_local only)
+  yarn_factor: number | null;
+  yarn_original_max_position_embeddings: number | null;
+  // Quantization / conversion metadata (mlx_local only)
+  q_bits: number | null;
+  q_group_size: number | null;
+  // KV cache constraints (mlx_local only)
+  kv_bits: number | null;
+  kv_group_size: number | null;
+  max_kv_size: number | null;
+  // Sampling parameters (all providers; top_k/min_p also work with vLLM)
+  top_p: number | null;
+  top_k: number | null;
+  min_p: number | null;
   is_enabled: boolean;
   has_api_key: boolean;
   created_at: string;
@@ -245,7 +259,9 @@ export interface BacktestRun {
   passed_cases: number;
   failed_cases: number;
   pass_rate: number | null;
+  avg_latency_ms: number | null;
   error_message: string | null;
+  total_latency_ms: number;
   started_at: string | null;
   completed_at: string | null;
   created_at: string;
@@ -262,6 +278,9 @@ export interface BacktestResult {
   cache_hit?: boolean;
   latency_ms: number | null;
   error_message: string | null;
+  // Set when inference begins; cleared when the result reaches a terminal state.
+  // While set, the row is "running" — the UI shows a live clock.
+  started_at?: string | null;
   created_at: string;
   test_case?: TestCase;
 }

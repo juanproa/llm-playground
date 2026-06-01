@@ -13,9 +13,21 @@ class ModelConfigCreate(BaseModel):
     temperature: float = 0.7
     extra_params: dict | None = None
     adapter_path: str | None = None
-    # Defaults to True (use model's built-in default). When False, MLX/Qwen3
-    # skips the <think>…</think> phase via chat_template_kwargs.
     enable_thinking: bool = True
+    # Sampling — NULL means use provider default
+    top_p: float | None = None
+    top_k: int | None = None
+    min_p: float | None = None
+    # YaRN context extension
+    yarn_factor: float | None = None
+    yarn_original_max_position_embeddings: int | None = None
+    # Quantization / conversion metadata (mlx_lm.convert command params)
+    q_bits: int | None = None
+    q_group_size: int | None = None
+    # KV cache constraints for mlx_lm inference
+    kv_bits: int | None = None
+    kv_group_size: int | None = None
+    max_kv_size: int | None = None
 
 
 class ModelConfigUpdate(BaseModel):
@@ -30,7 +42,17 @@ class ModelConfigUpdate(BaseModel):
     extra_params: dict | None = None
     adapter_path: str | None = None
     enable_thinking: bool | None = None
+    top_p: float | None = None
+    top_k: int | None = None
+    min_p: float | None = None
     is_enabled: bool | None = None
+    yarn_factor: float | None = None
+    yarn_original_max_position_embeddings: int | None = None
+    q_bits: int | None = None
+    q_group_size: int | None = None
+    kv_bits: int | None = None
+    kv_group_size: int | None = None
+    max_kv_size: int | None = None
 
 
 class ModelConfigResponse(BaseModel):
@@ -45,6 +67,16 @@ class ModelConfigResponse(BaseModel):
     extra_params: dict | None
     adapter_path: str | None = None
     enable_thinking: bool = True
+    top_p: float | None = None
+    top_k: int | None = None
+    min_p: float | None = None
+    yarn_factor: float | None = None
+    yarn_original_max_position_embeddings: int | None = None
+    q_bits: int | None = None
+    q_group_size: int | None = None
+    kv_bits: int | None = None
+    kv_group_size: int | None = None
+    max_kv_size: int | None = None
     is_enabled: bool
     has_api_key: bool
     created_at: datetime

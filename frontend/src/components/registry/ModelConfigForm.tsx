@@ -201,6 +201,21 @@ const EMPTY_FORM = {
   adapter_path: '',
   enable_thinking: true,
   is_enabled: true,
+  // YaRN context extension
+  yarn_enabled: false,
+  yarn_factor: 4.0,
+  yarn_original_max_position_embeddings: 32768,
+  // Quantization / conversion metadata
+  q_bits: null as number | null,
+  q_group_size: null as number | null,
+  // KV cache
+  kv_bits: null as number | null,
+  kv_group_size: 64,
+  max_kv_size: null as number | null,
+  // Sampling (all providers)
+  top_p: null as number | null,
+  top_k: null as number | null,
+  min_p: null as number | null,
 };
 
 interface Props {
@@ -235,6 +250,17 @@ export function ModelConfigForm({ open, onClose, editModel }: Props) {
         adapter_path: editModel.adapter_path || '',
         enable_thinking: editModel.enable_thinking ?? true,
         is_enabled: editModel.is_enabled,
+        yarn_enabled: editModel.yarn_factor != null,
+        yarn_factor: editModel.yarn_factor ?? 4.0,
+        yarn_original_max_position_embeddings: editModel.yarn_original_max_position_embeddings ?? 32768,
+        q_bits: editModel.q_bits ?? null,
+        q_group_size: editModel.q_group_size ?? null,
+        kv_bits: editModel.kv_bits ?? null,
+        kv_group_size: editModel.kv_group_size ?? 64,
+        max_kv_size: editModel.max_kv_size ?? null,
+        top_p: editModel.top_p ?? null,
+        top_k: editModel.top_k ?? null,
+        min_p: editModel.min_p ?? null,
       });
     } else if (!editModel && open) {
       setForm(EMPTY_FORM);
@@ -271,6 +297,22 @@ export function ModelConfigForm({ open, onClose, editModel }: Props) {
     if (!form.name.trim() || !form.model_id.trim()) return;
     setLoading(true);
     try {
+      const mlxFields = form.provider === 'mlx_local' ? {
+        yarn_factor: form.yarn_enabled ? form.yarn_factor : null,
+        yarn_original_max_position_embeddings: form.yarn_enabled ? form.yarn_original_max_position_embeddings : null,
+        q_bits: form.q_bits,
+        q_group_size: form.q_group_size,
+        kv_bits: form.kv_bits,
+        kv_group_size: form.kv_bits != null ? form.kv_group_size : null,
+        max_kv_size: form.max_kv_size,
+      } : {};
+
+      const samplingFields = {
+        top_p: form.top_p,
+        top_k: form.top_k,
+        min_p: form.min_p,
+      };
+
       if (isEdit) {
         const data: Record<string, unknown> = {
           name: form.name.trim(),
@@ -283,6 +325,8 @@ export function ModelConfigForm({ open, onClose, editModel }: Props) {
           adapter_path: form.adapter_path || null,
           enable_thinking: form.enable_thinking,
           is_enabled: form.is_enabled,
+          ...samplingFields,
+          ...mlxFields,
         };
         if (form.api_key) data.api_key = form.api_key;
         await updateModel(editModel!.id, data);
@@ -298,6 +342,8 @@ export function ModelConfigForm({ open, onClose, editModel }: Props) {
           temperature: form.temperature,
           adapter_path: form.adapter_path || undefined,
           enable_thinking: form.enable_thinking,
+          ...samplingFields,
+          ...mlxFields,
         });
       }
       setForm(EMPTY_FORM);
@@ -563,6 +609,203 @@ export function ModelConfigForm({ open, onClose, editModel }: Props) {
           ))}
         </Presets>
       </FormGroup>
+
+      {/* ── Advanced Sampling (all providers) ────────────────────────── */}
+      <FormGroup>
+        <Label>Advanced Sampling (optional)</Label>
+        <div style={{ display: 'flex', gap: 12, marginTop: 6, flexWrap: 'wrap' }}>
+          <div style={{ flex: 1, minWidth: 140 }}>
+            <Label style={{ fontSize: '0.72rem' }}>
+              top_p{form.top_p != null ? ` — ${form.top_p.toFixed(2)}` : ' — off'}
+            </Label>
+            <SliderRow>
+              <Slider
+                type="range" min={0} max={1} step={0.01}
+                value={form.top_p ?? 1}
+                onChange={(e) => update('top_p', parseFloat(e.target.value))}
+                disabled={form.top_p == null}
+                style={{ opacity: form.top_p == null ? 0.4 : 1 }}
+              />
+              <Toggle $active={form.top_p != null}
+                onClick={() => update('top_p', form.top_p != null ? null : 0.9)}>
+                <ToggleKnob $active={form.top_p != null} />
+              </Toggle>
+            </SliderRow>
+          </div>
+          <div style={{ flex: 1, minWidth: 140 }}>
+            <Label style={{ fontSize: '0.72rem' }}>
+              min_p{form.min_p != null ? ` — ${form.min_p.toFixed(2)}` : ' — off'}
+            </Label>
+            <SliderRow>
+              <Slider
+                type="range" min={0} max={0.5} step={0.01}
+                value={form.min_p ?? 0}
+                onChange={(e) => update('min_p', parseFloat(e.target.value))}
+                disabled={form.min_p == null}
+                style={{ opacity: form.min_p == null ? 0.4 : 1 }}
+              />
+              <Toggle $active={form.min_p != null}
+                onClick={() => update('min_p', form.min_p != null ? null : 0.05)}>
+                <ToggleKnob $active={form.min_p != null} />
+              </Toggle>
+            </SliderRow>
+          </div>
+          <div style={{ flex: 1, minWidth: 140 }}>
+            <Label style={{ fontSize: '0.72rem' }}>
+              top_k{form.top_k != null ? ` — ${form.top_k}` : ' — off'}
+            </Label>
+            <SliderRow>
+              <Input
+                type="number"
+                placeholder="e.g. 50"
+                value={form.top_k ?? ''}
+                onChange={(e) => update('top_k', e.target.value ? parseInt(e.target.value) : null)}
+                style={{ flex: 1 }}
+              />
+            </SliderRow>
+          </div>
+        </div>
+        <ParamHint>
+          Leave off to use the model default. top_p and min_p filter low-probability tokens; top_k limits the candidate pool.
+          top_k and min_p work with vLLM-compatible endpoints; top_p is valid for all providers.
+        </ParamHint>
+      </FormGroup>
+
+      {/* ── MLX-only advanced sections ─────────────────────────────────── */}
+      {form.provider === 'mlx_local' && (
+        <>
+          {/* ── YaRN Context Expansion ── */}
+          <FormGroup>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+              <Label style={{ marginBottom: 0 }}>YaRN Context Expansion</Label>
+              <ToggleRow>
+                <ToggleLabel>{form.yarn_enabled ? 'On' : 'Off'}</ToggleLabel>
+                <Toggle $active={form.yarn_enabled} onClick={() => update('yarn_enabled', !form.yarn_enabled)}>
+                  <ToggleKnob $active={form.yarn_enabled} />
+                </Toggle>
+              </ToggleRow>
+            </div>
+            {form.yarn_enabled ? (
+              <>
+                <div style={{ display: 'flex', gap: 12, marginTop: 10 }}>
+                  <div style={{ flex: 1 }}>
+                    <Label style={{ fontSize: '0.72rem' }}>Factor</Label>
+                    <SliderRow>
+                      <Slider type="range" min={1} max={8} step={0.5}
+                        value={form.yarn_factor}
+                        onChange={(e) => update('yarn_factor', parseFloat(e.target.value))} />
+                      <SliderValue>{form.yarn_factor}×</SliderValue>
+                    </SliderRow>
+                    <Presets>
+                      {[2, 4, 8].map(v => (
+                        <PresetChip key={v} $active={form.yarn_factor === v} onClick={() => update('yarn_factor', v)}>{v}×</PresetChip>
+                      ))}
+                    </Presets>
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <Label style={{ fontSize: '0.72rem' }}>Native context (tokens)</Label>
+                    <Presets style={{ marginTop: 8 }}>
+                      {[32768, 65536, 131072].map(v => (
+                        <PresetChip key={v} $active={form.yarn_original_max_position_embeddings === v}
+                          onClick={() => update('yarn_original_max_position_embeddings', v)}>
+                          {(v / 1024).toFixed(0)}k
+                        </PresetChip>
+                      ))}
+                    </Presets>
+                  </div>
+                </div>
+                <ParamHint>
+                  Extended context: <strong>{((form.yarn_original_max_position_embeddings * form.yarn_factor) / 1024).toFixed(0)}k tokens</strong>.
+                  Injects <code>rope_scaling</code> into the model config before loading — no file edits needed.
+                </ParamHint>
+              </>
+            ) : (
+              <ParamHint>Enable to extend context beyond the model's native limit via rotary embedding interpolation.</ParamHint>
+            )}
+          </FormGroup>
+
+          {/* ── Quantization / Conversion ── */}
+          <FormGroup>
+            <Label>Quantization (conversion reference) — optional</Label>
+            <div style={{ display: 'flex', gap: 12, marginTop: 6 }}>
+              <div style={{ flex: 1 }}>
+                <Label style={{ fontSize: '0.72rem' }}>q-bits {form.q_bits == null && <span style={{ color: tokens.colors.text.muted }}>(not set)</span>}</Label>
+                <Presets>
+                  {[4, 8].map(v => (
+                    <PresetChip key={v} $active={form.q_bits === v} onClick={() => update('q_bits', form.q_bits === v ? null : v)}>{v}-bit</PresetChip>
+                  ))}
+                </Presets>
+              </div>
+              <div style={{ flex: 1 }}>
+                <Label style={{ fontSize: '0.72rem' }}>Group size {form.q_group_size == null && <span style={{ color: tokens.colors.text.muted }}>(not set)</span>}</Label>
+                <Presets>
+                  {[32, 64, 128].map(v => (
+                    <PresetChip key={v} $active={form.q_group_size === v} onClick={() => update('q_group_size', form.q_group_size === v ? null : v)}>{v}</PresetChip>
+                  ))}
+                </Presets>
+              </div>
+            </div>
+            {form.model_id && form.q_bits != null && form.q_group_size != null && (
+              <div style={{
+                marginTop: 10, padding: '8px 10px',
+                background: 'rgba(0,0,0,0.25)', borderRadius: 6,
+                fontFamily: 'monospace', fontSize: '0.7rem', color: '#a8b2c1',
+                whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+              }}>
+                {`python3 -m mlx_lm.convert \\\n  --hf-path ${form.model_id} \\\n  --mlx-path ./models/${form.model_id.split('/').pop()}-${form.q_bits}bit \\\n  --quantize \\\n  --q-bits ${form.q_bits} \\\n  --q-group-size ${form.q_group_size}`}
+              </div>
+            )}
+            <ParamHint>Optional — stored for reference only, does not affect inference. Set both values to generate the mlx_lm.convert command.</ParamHint>
+          </FormGroup>
+
+          {/* ── KV Cache ── */}
+          <FormGroup>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+              <Label style={{ marginBottom: 0 }}>KV Cache Quantization</Label>
+              <ToggleRow>
+                <ToggleLabel>{form.kv_bits != null ? 'On' : 'Off'}</ToggleLabel>
+                <Toggle $active={form.kv_bits != null}
+                  onClick={() => update('kv_bits', form.kv_bits != null ? null : 8)}>
+                  <ToggleKnob $active={form.kv_bits != null} />
+                </Toggle>
+              </ToggleRow>
+            </div>
+            {form.kv_bits != null && (
+              <div style={{ display: 'flex', gap: 12, marginTop: 8 }}>
+                <div style={{ flex: 1 }}>
+                  <Label style={{ fontSize: '0.72rem' }}>KV bits</Label>
+                  <Presets>
+                    {[4, 8].map(v => (
+                      <PresetChip key={v} $active={form.kv_bits === v} onClick={() => update('kv_bits', v)}>{v}-bit</PresetChip>
+                    ))}
+                  </Presets>
+                </div>
+                <div style={{ flex: 1 }}>
+                  <Label style={{ fontSize: '0.72rem' }}>KV group size</Label>
+                  <Presets>
+                    {[32, 64, 128].map(v => (
+                      <PresetChip key={v} $active={form.kv_group_size === v} onClick={() => update('kv_group_size', v)}>{v}</PresetChip>
+                    ))}
+                  </Presets>
+                </div>
+              </div>
+            )}
+            <div style={{ marginTop: form.kv_bits != null ? 10 : 8 }}>
+              <Label style={{ fontSize: '0.72rem' }}>Max KV size (tokens, blank = unlimited)</Label>
+              <Input
+                type="number"
+                placeholder="e.g. 64000"
+                value={form.max_kv_size ?? ''}
+                onChange={(e) => update('max_kv_size', e.target.value ? parseInt(e.target.value) : null)}
+              />
+            </div>
+            <ParamHint>
+              Compresses attention states to reduce unified memory pressure. 8-bit has negligible accuracy impact.
+              Max KV size caps the rolling context window to prevent kernel panics under long-context loads.
+            </ParamHint>
+          </FormGroup>
+        </>
+      )}
 
       {isEdit && (
         <FormGroup>

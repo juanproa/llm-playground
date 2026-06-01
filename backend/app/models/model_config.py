@@ -32,6 +32,22 @@ class ModelConfig(Base):
     # model never enters thinking mode — no <think> tags, no wasted output
     # tokens. Providers that don't recognize the kwarg ignore it.
     enable_thinking: Mapped[bool] = mapped_column(Boolean, default=True)
+    # Sampling parameters — override the model's defaults at inference time.
+    # NULL means "use provider default" (no kwarg sent).
+    top_p: Mapped[float | None] = mapped_column(Float, nullable=True)
+    top_k: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    min_p: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # YaRN context extension — injects rope_scaling into model config at load time.
+    # yarn_factor=4.0 with original_max_position_embeddings=32768 → 131k context.
+    yarn_factor: Mapped[float | None] = mapped_column(Float, nullable=True)
+    yarn_original_max_position_embeddings: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Quantization parameters stored for reference / mlx_lm.convert command generation only.
+    q_bits: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    q_group_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # KV cache constraints — passed to mlx_lm.generate / stream_generate at inference time.
+    kv_bits: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    kv_group_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    max_kv_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
     is_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at: Mapped[datetime] = mapped_column(

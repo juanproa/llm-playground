@@ -10,7 +10,7 @@ import time
 from collections import Counter
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import async_session
@@ -451,11 +451,15 @@ async def _execute_backtest(db: AsyncSession, backtest_run_id: str) -> None:
 
         # Load test case result stubs (already created by router).
         # Filter to only pending results so resumed runs skip already-completed cases.
+        tc_order = text("pt_test_cases.rowid DESC") if run.reverse_order else text("pt_test_cases.rowid ASC")
         result_rows = await db.execute(
-            select(BacktestResult).where(
+            select(BacktestResult)
+            .join(TestCase, BacktestResult.test_case_id == TestCase.id)
+            .where(
                 BacktestResult.backtest_run_id == backtest_run_id,
                 BacktestResult.status == "pending",
             )
+            .order_by(tc_order)
         )
         result_list = list(result_rows.scalars().all())
 

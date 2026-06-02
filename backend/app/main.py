@@ -41,6 +41,7 @@ def _run_migrations(conn) -> None:
         ("pt_backtest_runs", "pass_threshold", "ALTER TABLE pt_backtest_runs ADD COLUMN pass_threshold FLOAT DEFAULT 0.5"),
         ("pt_backtest_runs", "judge_model_config_id", "ALTER TABLE pt_backtest_runs ADD COLUMN judge_model_config_id VARCHAR(36)"),
         ("pt_backtest_runs", "input_signature", "ALTER TABLE pt_backtest_runs ADD COLUMN input_signature VARCHAR(64)"),
+        ("pt_backtest_runs", "reverse_order", "ALTER TABLE pt_backtest_runs ADD COLUMN reverse_order BOOLEAN DEFAULT 0"),
         ("pt_inference_cache", "input_hash", "ALTER TABLE pt_inference_cache ADD COLUMN input_hash VARCHAR(64)"),
         ("pt_test_cases", "pii_status", "ALTER TABLE pt_test_cases ADD COLUMN pii_status VARCHAR(20) DEFAULT 'unchecked'"),
         ("pt_test_cases", "pii_masked_content", "ALTER TABLE pt_test_cases ADD COLUMN pii_masked_content TEXT"),

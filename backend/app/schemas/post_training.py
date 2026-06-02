@@ -275,6 +275,7 @@ class BacktestRunCreate(BaseModel):
     # When set, uses this model to grade each result (LLM-as-judge) instead of string matching
     judge_model_config_id: str | None = None
     test_case_ids: list[str] | None = None  # None = use all project test cases
+    reverse_order: bool = False
 
 
 class BacktestRunResponse(BaseModel):
@@ -293,6 +294,7 @@ class BacktestRunResponse(BaseModel):
     failed_cases: int
     pass_rate: float | None
     error_message: str | None
+    reverse_order: bool = False
     started_at: datetime | None
     completed_at: datetime | None
     created_at: datetime

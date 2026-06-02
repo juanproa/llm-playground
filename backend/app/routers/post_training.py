@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
 from fastapi.responses import PlainTextResponse
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.dependencies import get_db
@@ -956,7 +956,7 @@ async def list_test_cases(project_id: str, db: AsyncSession = Depends(get_db)):
     result = await db.execute(
         select(TestCase)
         .where(TestCase.project_id == project_id)
-        .order_by(TestCase.created_at.desc())
+        .order_by(text("rowid ASC"))
     )
     cases = list(result.scalars().all())
     # Replace `input_text` with the PII-masked version when the source dataset
@@ -1171,6 +1171,7 @@ async def create_backtest_run(
         judge_model_config_id=data.judge_model_config_id,
         total_cases=len(test_cases),
         input_signature=target_signature,
+        reverse_order=data.reverse_order,
     )
     db.add(run)
     await db.flush()
@@ -1205,10 +1206,12 @@ async def get_backtest_run(project_id: str, run_id: str, db: AsyncSession = Depe
     if not run or run.project_id != project_id:
         raise HTTPException(status_code=404, detail="Backtest run not found")
 
+    tc_order = text("pt_test_cases.rowid DESC") if run.reverse_order else text("pt_test_cases.rowid ASC")
     result = await db.execute(
         select(BacktestResult)
+        .join(TestCase, BacktestResult.test_case_id == TestCase.id)
         .where(BacktestResult.backtest_run_id == run_id)
-        .order_by(BacktestResult.created_at.asc())
+        .order_by(tc_order)
     )
     raw_results = list(result.scalars().all())
 

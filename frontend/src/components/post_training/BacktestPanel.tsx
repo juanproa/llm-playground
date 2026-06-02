@@ -593,6 +593,7 @@ export function BacktestPanel({ projectId }: Props) {
   const [runJudgeModelId, setRunJudgeModelId] = useState('');
   const [runCaseLimit, setRunCaseLimit] = useState<string>('');
   const [runCaseLimitLast, setRunCaseLimitLast] = useState<string>('');
+  const [runCaseLimitLastReversed, setRunCaseLimitLastReversed] = useState<string>('');
 
   useEffect(() => {
     fetchPrompts(projectId);
@@ -1055,11 +1056,14 @@ export function BacktestPanel({ projectId }: Props) {
     try {
       const limit = runCaseLimit !== '' ? parseInt(runCaseLimit, 10) : null;
       const limitLast = runCaseLimitLast !== '' ? parseInt(runCaseLimitLast, 10) : null;
-      const caseIds = limitLast && limitLast > 0
-        ? testCases.slice(-limitLast).map((tc) => tc.id)
-        : limit && limit > 0
-          ? testCases.slice(0, limit).map((tc) => tc.id)
-          : undefined;
+      const limitLastRev = runCaseLimitLastReversed !== '' ? parseInt(runCaseLimitLastReversed, 10) : null;
+      const caseIds = limitLastRev && limitLastRev > 0
+        ? testCases.slice(-limitLastRev).map((tc) => tc.id)
+        : limitLast && limitLast > 0
+          ? testCases.slice(-limitLast).map((tc) => tc.id)
+          : limit && limit > 0
+            ? testCases.slice(0, limit).map((tc) => tc.id)
+            : undefined;
       await postTrainingApi.createBacktestRun(projectId, {
         name: runName,
         prompt_version_id: runPromptVersionId,
@@ -1067,12 +1071,15 @@ export function BacktestPanel({ projectId }: Props) {
         pass_threshold: runPassThreshold,
         judge_model_config_id: runJudgeModelId || undefined,
         test_case_ids: caseIds,
+        reverse_order: !!(limitLastRev && limitLastRev > 0),
       });
       setRunName('');
       setRunPromptVersionId('');
       setRunModelConfigId('');
       setRunPassThreshold(0.5);
       setRunCaseLimit('');
+      setRunCaseLimitLast('');
+      setRunCaseLimitLastReversed('');
       setShowRunModal(false);
       await loadData();
     } catch (e) {
@@ -1548,7 +1555,7 @@ export function BacktestPanel({ projectId }: Props) {
                   max={testCases.length}
                   placeholder={`All ${testCases.length}`}
                   value={runCaseLimit}
-                  onChange={(e) => { setRunCaseLimit(e.target.value); if (e.target.value) setRunCaseLimitLast(''); }}
+                  onChange={(e) => { setRunCaseLimit(e.target.value); if (e.target.value) { setRunCaseLimitLast(''); setRunCaseLimitLastReversed(''); } }}
                   style={{ width: 120 }}
                 />
                 <CardMeta style={{ marginTop: 2 }}>
@@ -1563,13 +1570,45 @@ export function BacktestPanel({ projectId }: Props) {
                   max={testCases.length}
                   placeholder={`All ${testCases.length}`}
                   value={runCaseLimitLast}
-                  onChange={(e) => { setRunCaseLimitLast(e.target.value); if (e.target.value) setRunCaseLimit(''); }}
+                  onChange={(e) => { setRunCaseLimitLast(e.target.value); if (e.target.value) { setRunCaseLimit(''); setRunCaseLimitLastReversed(''); } }}
                   style={{ width: 120 }}
                 />
                 <CardMeta style={{ marginTop: 2 }}>
-                  Run only the last N test cases. Leave blank to use all {testCases.length}.
+                  Run only the last N test cases (oldest → newest). Leave blank to use all {testCases.length}.
                 </CardMeta>
               </FormGroup>
+              <FormGroup>
+                <Label>Last N cases — newest first (optional)</Label>
+                <Input
+                  type="number"
+                  min={1}
+                  max={testCases.length}
+                  placeholder={`All ${testCases.length}`}
+                  value={runCaseLimitLastReversed}
+                  onChange={(e) => { setRunCaseLimitLastReversed(e.target.value); if (e.target.value) { setRunCaseLimit(''); setRunCaseLimitLast(''); } }}
+                  style={{ width: 120 }}
+                />
+                <CardMeta style={{ marginTop: 2 }}>
+                  Run only the last N test cases, displayed newest → oldest (125, 124 … 121).
+                </CardMeta>
+              </FormGroup>
+              {(() => {
+                const lim = runCaseLimit !== '' ? parseInt(runCaseLimit, 10) : null;
+                const limLast = runCaseLimitLast !== '' ? parseInt(runCaseLimitLast, 10) : null;
+                const limLastRev = runCaseLimitLastReversed !== '' ? parseInt(runCaseLimitLastReversed, 10) : null;
+                const count = limLastRev && limLastRev > 0
+                  ? Math.min(limLastRev, testCases.length)
+                  : limLast && limLast > 0
+                    ? Math.min(limLast, testCases.length)
+                    : lim && lim > 0
+                      ? Math.min(lim, testCases.length)
+                      : testCases.length;
+                return (
+                  <CardMeta style={{ marginBottom: 8, fontWeight: 600 }}>
+                    {count} case{count !== 1 ? 's' : ''} will run
+                  </CardMeta>
+                );
+              })()}
               <Button
                 disabled={loading || !runName.trim() || !runPromptVersionId || !runModelConfigId}
                 onClick={handleCreateRun}

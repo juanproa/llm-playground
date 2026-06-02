@@ -251,6 +251,7 @@ class BacktestRun(Base):
     # Nullable for backwards compat with rows created before this column existed —
     # a NULL signature is treated as "unknown" and does not match any new run.
     input_signature: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    reverse_order: Mapped[bool] = mapped_column(default=False)
 
     project = relationship("Project")
     prompt_version = relationship("PromptVersion")

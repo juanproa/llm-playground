@@ -56,6 +56,16 @@ async def create_model(db: AsyncSession, data: ModelConfigCreate) -> ModelConfig
         extra_params=data.extra_params,
         adapter_path=data.adapter_path,
         enable_thinking=data.enable_thinking,
+        top_p=data.top_p,
+        top_k=data.top_k,
+        min_p=data.min_p,
+        yarn_factor=data.yarn_factor,
+        yarn_original_max_position_embeddings=data.yarn_original_max_position_embeddings,
+        q_bits=data.q_bits,
+        q_group_size=data.q_group_size,
+        kv_bits=data.kv_bits,
+        kv_group_size=data.kv_group_size,
+        max_kv_size=data.max_kv_size,
     )
     db.add(model)
     await db.flush()

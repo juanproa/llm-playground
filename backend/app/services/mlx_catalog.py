@@ -24,6 +24,15 @@ class MlxModel(BaseModel):
 KNOWN_MLX_MODELS: list[MlxModel] = [
     # ── Gemma family ──
     MlxModel(
+        id="mlx-community/gemma-4-12B-4bit",
+        name="Gemma 4 12B (4-bit)",
+        size="12B",
+        family="gemma",
+        quantization="4bit",
+        hf_original="google/gemma-4-12b",
+        notes="Gemma 4 multimodal architecture (text-only inference).",
+    ),
+    MlxModel(
         id="mlx-community/gemma-2-2b-it-4bit",
         name="Gemma 2 2B IT (4-bit)",
         size="2B",

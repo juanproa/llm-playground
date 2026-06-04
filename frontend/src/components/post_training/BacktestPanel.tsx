@@ -1742,7 +1742,7 @@ export function BacktestPanel({ projectId }: Props) {
                         </Td>
                         <Td>
                           {r.pass_score != null ? (
-                            <span style={{ fontFamily: tokens.fonts.mono, color: r.pass_score >= 0.7 ? tokens.colors.accent.success : tokens.colors.accent.error }}>
+                            <span style={{ fontFamily: tokens.fonts.mono, color: r.pass_score >= (selectedRun.pass_threshold ?? 0.5) ? tokens.colors.accent.success : tokens.colors.accent.error }}>
                               {(r.pass_score * 100).toFixed(0)}%
                             </span>
                           ) : '—'}

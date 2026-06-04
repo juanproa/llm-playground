@@ -5,7 +5,9 @@ import asyncio
 import difflib
 import json
 import logging
+import platform
 import re
+import subprocess
 import time
 from collections import Counter
 from datetime import datetime, timezone
@@ -402,8 +404,21 @@ async def run_backtest(backtest_run_id: str, db: AsyncSession | None = None) -> 
     scores results, and persists aggregated metrics. Designed to be called as
     a background task. Always creates its own DB session.
     """
-    async with async_session() as session:
-        await _execute_backtest(session, backtest_run_id)
+    # On macOS, prevent the system from idle-sleeping while the backtest runs.
+    # Without this, a display-off / unattended run gets suspended mid-case.
+    caffeinate = None
+    if platform.system() == "Darwin":
+        try:
+            caffeinate = subprocess.Popen(["caffeinate", "-i"])
+        except Exception:
+            pass  # Non-fatal: caffeinate missing or unavailable
+
+    try:
+        async with async_session() as session:
+            await _execute_backtest(session, backtest_run_id)
+    finally:
+        if caffeinate is not None:
+            caffeinate.terminate()
 
 
 async def _is_run_cancelling(run_id: str) -> bool:

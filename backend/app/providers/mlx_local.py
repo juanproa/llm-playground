@@ -28,7 +28,6 @@ logger = logging.getLogger(__name__)
 os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "60")
 os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
 
-
 # ── Module-level cache of loaded models ─────────────────────────────────────
 # Each entry keyed by (model_id, adapter_path) -> (model, tokenizer).
 # Bounded to 1 entry so we don't hold multiple large MLX models in unified
